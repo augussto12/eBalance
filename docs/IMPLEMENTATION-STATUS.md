@@ -39,6 +39,7 @@ La app funciona de punta a punta en local sobre el stack de producción: TLS →
 | `dotnet list … package --vulnerable --include-transitive` | Sin vulnerabilidades |
 | `npm audit` (web y e2e) | 0 vulnerabilidades |
 | Modo desarrollo (`dotnet run` + `vite` con proxy) | Login por el proxy: OK |
+| GitHub Actions `ci` (run 39853251610) | backend, frontend, images y secrets: OK |
 
 ### Verificaciones de perímetro (stack local)
 
@@ -65,7 +66,7 @@ La app funciona de punta a punta en local sobre el stack de producción: TLS →
 | XSS en concepto → texto | `Html_in_concept…` + E2E 4 (sin `<img>` en el DOM ni diálogos) |
 | Importación inválida → sin escritura parcial | `Invalid_import_writes_nothing` |
 | Sin mass assignment | `Unknown_json_properties_are_rejected…` |
-| Sin secretos en bundle/logs/Git | `.gitignore`, verificación de logs (arriba), job `secrets` del CI (gitleaks) **aún no ejecutado** |
+| Sin secretos en bundle/logs/Git | `.gitignore`, verificación de logs (arriba), job `secrets` del CI (gitleaks, historial completo: OK) y control del bundle en CI |
 | Sin acceso externo a la DB | verificado en el stack local; **falta repetirlo desde afuera en la VPS** |
 
 ### Casos de aceptación monetarios (docs/05)
@@ -104,7 +105,7 @@ Diferencias **intencionales** respecto del prototipo:
 
 1. **Despliegue en la VPS:** nada se ejecutó allí. Falta: certificado Let's Encrypt real, `install-nginx-site.sh` sobre el Nginx existente, HSTS, `nmap` externo y medir RTO.
 2. **Copia de backup fuera de la VPS** (`OFFSITE_RESTIC_REPOSITORY`): implementada, no probada. Falta elegir destino.
-3. **CI** (`.github/workflows/ci.yml`): escrito, todavía no corrió en GitHub (incluye gitleaks y build de imágenes). Revisar el primer run después del push.
+3. CI: el primer run falló por un control demasiado ingenuo de «secretos en el bundle» (la palabra `password` de los formularios); se corrigió. El run 39853251610 pasó completo: backend, frontend, imágenes y gitleaks sobre todo el historial.
 4. `rotate-secrets.sh restic` y `db-migrator`: no ejecutados.
 5. Alertas fuera del servidor: solo hay unidades systemd que fallan; falta elegir canal (`OnFailure=`).
 6. Escaneo de imágenes de contenedor (Trivy/Grype): no ejecutado.
