@@ -11,6 +11,15 @@ Todos los comandos se probaron en un entorno local equivalente (Docker Compose +
 
 ## 1. Primer despliegue con el instalador (recomendado)
 
+**Si la VPS ya tiene otros proyectos**, primero corré el relevamiento de solo lectura. No instala ni cambia nada, no muestra variables de entorno ni contenidos de `.env` o compose, y tapa contraseñas y tokens. Revisá el reporte antes de compartirlo:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/augussto12/eBalance/implementacion-v1/infra/scripts/vps-survey.sh -o vps-survey.sh
+sudo bash vps-survey.sh            # imprime el reporte y lo guarda en /tmp/relevamiento-vps.*.txt (modo 600)
+```
+
+Muestra qué ocupa los puertos 80/443 (Nginx del host o un proxy en contenedor: Traefik, Caddy, Nginx Proxy Manager, Coolify, etc.), cómo se publica cada contenedor, las redes y subredes, la memoria y el disco, los certificados, el firewall y las tareas programadas.
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/augussto12/eBalance/implementacion-v1/infra/scripts/vps-install.sh -o vps-install.sh
 less vps-install.sh                 # revisalo
