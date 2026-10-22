@@ -1,0 +1,10 @@
+[Unit]
+Description=Renovación del certificado TLS de Álvarez Finanzas (dos veces por día)
+
+[Timer]
+OnCalendar=*-*-* 00,12:00:00
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

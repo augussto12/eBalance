@@ -4,37 +4,64 @@ Todos los comandos se probaron en un entorno local equivalente (Docker Compose +
 
 ## 0. Requisitos de la VPS
 
-- Linux con systemd, Docker Engine y Docker Compose v2 (`docker compose version`), git, openssl, curl, python3.
-- Nginx del host ya instalado (puede tener otros sitios: no se toca `nginx.conf`), certbot.
-- SSH solo con claves; usuario administrativo con sudo. Firewall: solo 22 (idealmente restringido), 80 y 443.
+- Ubuntu 22.04/24.04 o Debian 12 con systemd. El instalador pone lo que falte: Docker Engine, Compose v2, buildx, Nginx, git y openssl. certbot **no** se instala en el sistema: corre en un contenedor fijado por digest.
+- Nginx del host: puede tener otros sitios. No se toca `nginx.conf`: se agrega un único sitio `zz-alvarez-finanzas.conf`, que por el nombre se carga último y nunca queda como sitio por defecto de otros proyectos.
+- SSH solo con claves; usuario administrativo con sudo. Firewall (ufw **y** el del panel del proveedor): solo 22 (idealmente restringido), 80 y 443. El 80 tiene que quedar abierto: lo usa la renovación del certificado.
 - Pertenecer al grupo `docker` equivale a tener root: limitarlo al usuario administrativo.
-- IPv6: la plantilla de Nginx escucha también en `[::]`. Si la VPS no tiene IPv6, borrá esas líneas (`nginx -t` lo detecta).
 
-## 1. Primer despliegue
+## 1. Primer despliegue con el instalador (recomendado)
 
 ```bash
-sudo mkdir -p /srv/alvarez-finanzas && sudo chown "$USER" /srv/alvarez-finanzas
-git clone https://github.com/augussto12/eBalance.git /srv/alvarez-finanzas/app
-cd /srv/alvarez-finanzas/app
-cp .env.example .env && nano .env      # PUBLIC_ORIGIN=https://finanzas.tu-dominio, SECRETS_DIR, BACKUP_DIR
+curl -fsSL https://raw.githubusercontent.com/augussto12/eBalance/implementacion-v1/infra/scripts/vps-install.sh -o vps-install.sh
+less vps-install.sh                 # revisalo
+sudo bash vps-install.sh --inspect  # solo inspecciona y reporta; no cambia nada
+tmux new -s alvarez 'sudo bash vps-install.sh'   # instalación completa (idempotente: se puede volver a correr)
+```
+
+Para ejecutar exactamente lo que revisaste, fijá el commit: `sudo COMMIT=<sha> bash vps-install.sh`. El instalador verifica que el commit pertenezca a la rama y lo usa en modo *detached*. Dentro de `tmux`, un corte de SSH no interrumpe la instalación (`tmux attach -t alvarez` para volver).
+
+**Inspección:** se detiene **antes de cambiar nada**, con un reporte, en estos casos:
+
+- Los puertos 80/443 los usa algo que no es el Nginx del host (Traefik de Coolify, Apache, un contenedor que publica 80/443).
+- `nginx -t` ya falla por otro sitio.
+- `http(s)://IP` ya sirve otro proyecto, u otro sitio ya es el default del 443 (modo IP).
+- Otro sitio usa el mismo nombre.
+- La red `172.30.57.0/24` se superpone con otra red de Docker o con una ruta del host.
+- Otro proyecto renueva certificados con `certbot --standalone` y habría que instalar Nginx.
+- Hay menos de 2,5 GiB de memoria disponible (RAM + swap libres) para compilar. Se puede pasar por alto con `ALLOW_LOW_MEMORY=1`.
+
+Las re-ejecuciones reconocen el sitio propio y mantienen la dirección guardada en `.env`. Para cambiarla, indicá `PUBLIC_HOST` o `TLS_MODE` explícitamente: el instalador emite el certificado nuevo y recién entonces actualiza `.env` y el sitio. Si ufw está activo, abre 80 y 443 **antes** del desafío ACME. El timer de renovación se instala apenas existe el certificado.
+
+**Dirección pública sin dominio propio** (`TLS_MODE=auto`):
+
+1. Si la VPS tiene un nombre del proveedor que apunta a su IP en el **DNS público** (en Hostinger, `srvNNNN.hstgr.cloud`), se usa ese nombre con un certificado normal de 90 días. Se consulta por DNS sobre HTTPS, no por `/etc/hosts`, y si el nombre tiene un AAAA que no es de la VPS se detiene. `hstgr.cloud` está en la Public Suffix List: cada `srvNNNN` es su propio «sitio». Para forzar la IP: `TLS_MODE=ip`.
+2. Si no, se emite un **certificado de Let's Encrypt para la IP**, con disponibilidad general desde el 15/01/2026: perfil `shortlived` de unas 160 h, validación http-01 por el puerto 80 y certbot 5.8 en contenedor. certbot lo renueva a mitad de vida (~80 h antes del vencimiento). El timer `alvarez-certbot.timer` corre dos veces por día y recarga Nginx solo si hubo renovación. `maintenance.sh` alerta si quedan menos de 48 h o si el certificado no valida para la IP. Con IP no hay HSTS.
+3. `TLS_MODE=sslip` existe, pero **no se recomienda** para datos financieros. `*.sslip.io` es un DNS de terceros que no está en la Public Suffix List: comparte «sitio» y cupo de certificados con miles de páginas ajenas, incluido phishing.
+4. Con dominio propio: `sudo PUBLIC_HOST=finanzas.tu-dominio bash vps-install.sh` (registro A apuntando a la VPS).
+
+**Qué hace al final:** construye las imágenes, migra con el rol migrador, levanta la app y corre los smoke tests y el preflight. Hace un backup y una prueba de restauración aislada, e instala los timers de certificado, backup y mantenimiento. Por último te pide crear tu usuario: la contraseña se escribe oculta y no queda en archivos ni en el historial. El registro sin secretos queda en `/srv/alvarez-finanzas/install.log`.
+
+Después de instalar, guardá en tu gestor de contraseñas, **fuera del servidor**:
+
+- `/srv/alvarez-finanzas/secrets/restic_password`: sin ella, los backups son ilegibles.
+- `/srv/alvarez-finanzas/secrets/keyring/current.pfx` y `current.password`: sin ellos no se pueden descifrar los segundos factores de un backup restaurado.
+
+### Despliegue manual (alternativa)
+
+```bash
+git clone -b implementacion-v1 https://github.com/augussto12/eBalance.git /srv/alvarez-finanzas/app && cd /srv/alvarez-finanzas/app
+cp .env.example .env && nano .env                     # PUBLIC_ORIGIN, SECRETS_DIR, BACKUP_DIR
 sudo ./infra/scripts/bootstrap-secrets.sh
+sudo ./infra/scripts/install-nginx-site.sh --acme-only finanzas.tu-dominio   # sitio temporal :80 solo para el desafío
+sudo ./infra/scripts/certbot.sh issue host finanzas.tu-dominio               # o, para una IP: issue ip 1.2.3.4
+sudo CERT_DIR=/etc/alvarez-finanzas/letsencrypt/live/alvarez-finanzas ./infra/scripts/install-nginx-site.sh finanzas.tu-dominio
+#   (para una IP agregá DEFAULT_443=1 NO_IPV6=1; el sitio final reemplaza al temporal)
+sudo cp infra/systemd/alvarez-certbot.* /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable --now alvarez-certbot.timer
+./infra/scripts/deploy.sh --first
+./infra/scripts/bootstrap-owner.sh --username augusto --display-name "Augusto Álvarez"
 ```
 
-`bootstrap-secrets.sh` genera contraseñas aleatorias de base y restic, y el certificado que cifra el key ring de Data Protection. Ajusta dueños y permisos: postgres uid 70, API uid 1654, modos 400/440 y directorio 700. **Nunca sobrescribe secretos existentes.** Guardá en tu gestor de contraseñas, **fuera del servidor**:
-
-- `secrets/restic_password`: sin él, los backups son ilegibles.
-- `secrets/keyring/current.pfx` y `current.password`: sin ellos no se pueden descifrar los segundos factores de un backup restaurado.
-
-DNS: registro A (y AAAA si corresponde) de `finanzas.tu-dominio` apuntando a la VPS. Luego:
-
-```bash
-sudo certbot certonly --nginx -d finanzas.tu-dominio        # solo emite el certificado; no edita sitios
-sudo ./infra/scripts/install-nginx-site.sh finanzas.tu-dominio   # valida con nginx -t antes de recargar
-./infra/scripts/deploy.sh --first      # build con tag = commit, migración con rol migrador, arranque, smoke tests
-./infra/scripts/bootstrap-owner.sh --username augusto --display-name "Augusto Álvarez"   # contraseña oculta por TTY
-```
-
-Abrí `https://finanzas.tu-dominio`, ingresá y configurá el autenticador (QR generado localmente). Guardá los 10 códigos de recuperación. Después:
+Abrí la dirección que mostró el instalador, ingresá y configurá el autenticador (QR generado localmente). Guardá los 10 códigos de recuperación. El instalador ya corrió preflight, backup y restore-test; para repetirlos:
 
 ```bash
 ./infra/scripts/preflight.sh           # debe terminar en «Preflight OK» (incluye TLS y check-config)
@@ -42,7 +69,9 @@ Abrí `https://finanzas.tu-dominio`, ingresá y configurá el autenticador (QR g
 ./infra/scripts/restore-test.sh        # debe terminar en resultado=OK ANTES de cargar datos reales
 ```
 
-**HSTS:** cuando HTTPS funcione bien, descomentá `Strict-Transport-Security` en `/etc/nginx/sites-available/alvarez-finanzas.conf` y corré `sudo nginx -t && sudo systemctl reload nginx`. No agregues `includeSubDomains` ni `preload` sin revisar todos los subdominios.
+`install-nginx-site.sh` corre `nginx -t` antes de tocar nada (si ya falla por otro sitio, no sigue). Instala el sitio con respaldo y, si la validación falla, restaura la versión anterior sin recargar Nginx. Agrega `listen [::]` solo si se lo pide el instalador porque Nginx ya escucha en IPv6.
+
+**HSTS** (solo con un dominio **propio** dedicado; nunca con IP ni con el nombre del proveedor, que comparte el host con otros proyectos HTTP): cuando HTTPS funcione bien, descomentá `Strict-Transport-Security` en `/etc/nginx/sites-available/zz-alvarez-finanzas.conf` y corré `sudo nginx -t && sudo systemctl reload nginx`. No agregues `includeSubDomains` ni `preload` sin revisar todos los subdominios.
 
 **Comprobación externa de puertos [no probado en VPS]:** desde otra máquina, `nmap -Pn -p 1-65535 finanzas.tu-dominio` debe mostrar solo 22/80/443. En la VPS, `ss -tlnp` debe mostrar el contenedor web solo en `127.0.0.1:8088`, y ningún 5432 ni 8080.
 
@@ -65,11 +94,11 @@ En el sitio anterior: «↓ Exportar respaldo» (JSON). En la app nueva: Configu
 
 ```bash
 sudo cp infra/systemd/alvarez-* /etc/systemd/system/ && sudo systemctl daemon-reload
-sudo systemctl enable --now alvarez-backup.timer alvarez-maintenance.timer
+sudo systemctl enable --now alvarez-certbot.timer alvarez-backup.timer alvarez-maintenance.timer   # el instalador ya lo hace
 systemctl list-timers 'alvarez-*'
 ```
 
-`maintenance.sh` purga la auditoría de más de 90 días (con el rol migrador, porque el runtime no puede borrarla) y falla si: el disco tiene menos de 2 GiB libres, algún servicio no está healthy, el certificado vence en menos de 14 días o no hubo un backup exitoso en las últimas 48 h. **Alertas:** una unidad fallida queda en `systemctl --failed` y `journalctl -u alvarez-maintenance`. Para recibir avisos, configurá `OnFailure=` hacia un destino que elijas (correo local, ntfy propio, etc.). Los mensajes no deben llevar contenido financiero. **[no configurado: decisión del propietario]**
+`maintenance.sh` corre todos los días. Purga la auditoría de más de 90 días (con el rol migrador, porque el runtime no puede borrarla) y falla si el disco tiene menos de 2 GiB libres, si algún servicio no está healthy, si no hubo un backup exitoso en las últimas 48 h o si el certificado está por vencer: menos de 48 h en uno de IP, menos de 14 días en uno normal. **Alertas:** una unidad fallida queda en `systemctl --failed` y `journalctl -u alvarez-maintenance`. Para recibir avisos, configurá `OnFailure=` hacia un destino que elijas (correo local, ntfy propio, etc.). Los mensajes no deben llevar contenido financiero. **[no configurado: decisión del propietario]**
 
 **Logs:** cada contenedor usa el driver `local` con rotación por tamaño (10 MB × 5). Eso limita el espacio, **no la antigüedad**. Para una retención estricta de 30 días, usá `logging.driver: journald` y en `/etc/systemd/journald.conf` poné `MaxRetentionSec=30day`. La API no registra cuerpos, cookies, tokens ni parámetros de consulta; Nginx registra rutas sin query string. Auditoría: tabla `audit_events`, 90 días.
 

@@ -54,7 +54,20 @@ common=(--network "$net" --read-only --tmpfs /tmp --cap-drop ALL --security-opt 
   -e "ConnectionStrings__App=Host=$proj-db;Database=alvarez;Username=restore;Gss Encryption Mode=Disable" -e ConnectionStrings__AppPasswordFile=/run/secrets/pw
   -e App__PublicOrigin=https://restore-test.invalid -e App__TrustedProxies=127.0.0.1 -e App__DataProtectionApplicationName=alvarez-finanzas-production
   -e App__KeyRingPath=/keys -e App__KeyRingCertificatePath=/run/keyring/current.pfx -e App__KeyRingCertificatePasswordFile=/run/keyring/current.password)
-docker run --rm "${common[@]}" "$api_img" verify-data --revoke-sessions | tee "$work/restored.json"
+# El informe (conteos y sumas) queda en el directorio temporal: por pantalla y en los registros, solo un resumen sin montos.
+summary() {
+  python3 - "$work/restored.json" <<'PY' || true
+import json, sys
+r = json.load(open(sys.argv[1]))
+print(f"verify-data: cuotas inconsistentes={r['plansWithInconsistentInstallments']} "
+      f"TOTP descifrables={r['totpDecryptable']}/{r['totpSecrets']} sesiones revocadas={r['sessionsRevoked']}")
+PY
+}
+if ! docker run --rm "${common[@]}" "$api_img" verify-data --revoke-sessions > "$work/restored.json"; then
+  summary
+  die "La verificación de datos restaurados falló"
+fi
+summary
 docker run -d --name "$proj-api" "${common[@]}" "$api_img" >/dev/null
 for _ in $(seq 1 30); do
   docker exec "$proj-api" wget -q -O - http://127.0.0.1:8080/api/health/ready 2>/dev/null | grep -q ok && break

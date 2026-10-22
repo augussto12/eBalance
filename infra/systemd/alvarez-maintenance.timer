@@ -1,8 +1,8 @@
 [Unit]
-Description=Mantenimiento semanal de Álvarez Finanzas
+Description=Mantenimiento diario de Álvarez Finanzas (TLS, disco, servicios, backup reciente)
 
 [Timer]
-OnCalendar=Sun *-*-* 04:41:00
+OnCalendar=*-*-* 04:41:00
 Persistent=true
 
 [Install]

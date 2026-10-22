@@ -78,4 +78,10 @@ wait_healthy api
 wait_healthy web
 smoke
 echo "$(date -u +%FT%TZ) $tag (anterior: ${previous:-ninguno})" >> .release-history
+# Imágenes viejas de ESTA app: se conservan la actual y la anterior (rollback). No se toca nada de otros proyectos.
+for repo in alvarez-finanzas-api alvarez-finanzas-web alvarez-finanzas-backup; do
+  for old in $(docker image ls "$repo" --format '{{.Tag}}' | grep -vxF -e "$tag" -e "${previous:-$tag}" || true); do
+    docker image rm "$repo:$old" >/dev/null 2>&1 || true
+  done
+done
 info "Desplegado $tag. Rollback: ./infra/scripts/deploy.sh --rollback ${previous:-<tag>}"

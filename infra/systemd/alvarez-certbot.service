@@ -1,0 +1,10 @@
+# Renovación del certificado TLS (certbot en contenedor, configuración aislada). Los certificados de IP duran ~6 días:
+# el timer corre dos veces por día y maintenance.sh alerta si quedan menos de 48 h.
+[Unit]
+Description=Álvarez Finanzas — renovación de certificado TLS
+Wants=docker.service
+After=docker.service network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/srv/alvarez-finanzas/app/infra/scripts/certbot.sh renew

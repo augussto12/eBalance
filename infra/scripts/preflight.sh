@@ -26,28 +26,22 @@ if git -C "$ROOT" ls-files --error-unmatch "$SECRETS_DIR" >/dev/null 2>&1; then 
 avail_kb=$(df -Pk "$ROOT" | awk 'NR==2{print $4}')
 (( avail_kb > 2*1024*1024 )) && ok "espacio libre $((avail_kb/1024)) MiB" || bad "menos de 2 GiB libres"
 
-if dc config --format json >/tmp/alvarez-compose.json 2>/dev/null; then
+compose_json="$(mktemp)"
+if dc config --format json >"$compose_json" 2>/dev/null; then
   ok "compose válido"
-  if grep -q '"published"' <(python3 -c 'import json,sys;d=json.load(open("/tmp/alvarez-compose.json"));print(json.dumps({k:v.get("ports") for k,v in d["services"].items() if k in("db","api")}))'); then
+  if grep -q '"published"' <(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));print(json.dumps({k:v.get("ports") for k,v in d["services"].items() if k in("db","api")}))' "$compose_json"); then
     bad "db o api publican puertos al host"
   else
     ok "db y api sin puertos publicados"
   fi
-  rm -f /tmp/alvarez-compose.json
+  rm -f "$compose_json"
 else
+  rm -f "$compose_json"
   bad "compose inválido"
 fi
 
 if [[ "${SKIP_TLS_CHECK:-0}" != 1 ]]; then
-  hostport="${PUBLIC_ORIGIN#https://}"; host="${hostport%%:*}"; [[ "$hostport" == *:* ]] || hostport="$hostport:443"
-  if exp=$(echo | timeout 10 openssl s_client -servername "$host" -connect "$hostport" 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null); then
-    end="${exp#notAfter=}"
-    days=$(( ( $(date -d "$end" +%s) - $(date +%s) ) / 86400 ))
-    (( days > 14 )) && ok "TLS válido ($days días restantes)" || bad "TLS vence en $days días"
-  else
-    warn "No se pudo verificar TLS de $host (¿DNS/certificado aún no configurados?). Usá SKIP_TLS_CHECK=1 solo para el primer arranque."
-    fail=1
-  fi
+  if msg="$(check_tls)"; then ok "$msg"; else bad "$msg"; fi
 fi
 
 if dc ps --status running api >/dev/null 2>&1 && [[ -n "$(dc ps -q api 2>/dev/null)" ]]; then
