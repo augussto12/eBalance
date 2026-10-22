@@ -1,0 +1,13 @@
+<Solution>
+  <Folder Name="/src/" />
+  <Folder Name="/src/api/">
+    <Project Path="src/api/AlvarezFinanzas.Api/AlvarezFinanzas.Api.csproj" />
+  </Folder>
+  <Folder Name="/tests/" />
+  <Folder Name="/tests/integration/">
+    <Project Path="tests/integration/AlvarezFinanzas.IntegrationTests/AlvarezFinanzas.IntegrationTests.csproj" />
+  </Folder>
+  <Folder Name="/tests/unit/">
+    <Project Path="tests/unit/AlvarezFinanzas.UnitTests/AlvarezFinanzas.UnitTests.csproj" />
+  </Folder>
+</Solution>

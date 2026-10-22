@@ -1,0 +1,5 @@
+{
+  "$schema": "https://xunit.net/schema/current/xunit.runner.schema.json",
+  "//": "WebApplicationFactory con hosting mínimo intercepta la construcción del host con un DiagnosticListener global: varias apps arrancando en paralelo pueden mezclar configuración. Se ejecuta en serie.",
+  "parallelizeTestCollections": false
+}

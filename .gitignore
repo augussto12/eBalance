@@ -1,0 +1,38 @@
+# Compilación
+bin/
+obj/
+node_modules/
+dist/
+*.tsbuildinfo
+test-results/
+playwright-report/
+coverage/
+
+# Secretos y datos: NUNCA en Git
+.env
+.env.*
+!.env.example
+secrets/
+infra/secrets/
+*.pfx
+*.p12
+*.key
+*.pem
+*.crt
+.dev-keys/
+**/.dev-keys/
+keys/
+backups/
+*.dump
+*.sql.gz
+*.restic
+imports/
+exports/
+*.log
+logs/
+
+# Editor
+.vs/
+.idea/
+*.user
+.DS_Store

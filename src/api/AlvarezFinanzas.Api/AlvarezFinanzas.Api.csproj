@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <RootNamespace>AlvarezFinanzas</RootNamespace>
+    <AssemblyName>AlvarezFinanzas.Api</AssemblyName>
+    <UserSecretsId>alvarez-finanzas-dev</UserSecretsId>
+    <!-- No exponer Swagger/OpenAPI en producción: no se incluye generador. -->
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.AspNetCore.Identity.EntityFrameworkCore" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Design">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+    <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" />
+    <PackageReference Include="EFCore.NamingConventions" />
+    <PackageReference Include="Otp.NET" />
+  </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="AlvarezFinanzas.UnitTests" />
+    <InternalsVisibleTo Include="AlvarezFinanzas.IntegrationTests" />
+  </ItemGroup>
+</Project>
