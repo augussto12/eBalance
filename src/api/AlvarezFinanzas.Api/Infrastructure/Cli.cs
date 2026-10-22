@@ -16,7 +16,7 @@ namespace AlvarezFinanzas.Infrastructure;
 /// </summary>
 public static partial class Cli
 {
-    private static readonly string[] Commands = ["migrate", "bootstrap-owner", "recover-owner", "revoke-sessions", "purge-audit", "check-config"];
+    private static readonly string[] Commands = ["migrate", "bootstrap-owner", "recover-owner", "revoke-sessions", "purge-audit", "check-config", "verify-data"];
     public static readonly string[] DefaultCategories = ["Otros", "Alimentación", "Hogar", "Servicios", "Tecnología", "Transporte", "Ocio", "Trabajo", "Salud"];
 
     public static bool IsCommand(string arg) => Commands.Contains(arg);
@@ -85,9 +85,10 @@ public static partial class Cli
                 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO {runtimeRole};
                 REVOKE UPDATE, DELETE, TRUNCATE ON audit_events FROM {runtimeRole};
                 REVOKE ALL ON "__EFMigrationsHistory" FROM {runtimeRole};
+                GRANT SELECT ON "__EFMigrationsHistory" TO {runtimeRole};
                 """;
             await db.Database.ExecuteSqlRawAsync(sql);
-            Console.WriteLine($"Permisos del rol {runtimeRole} actualizados (DML; auditoría solo INSERT/SELECT).");
+            Console.WriteLine($"Permisos del rol {runtimeRole} actualizados (DML; auditoría solo INSERT/SELECT; historial de migraciones solo SELECT).");
         }
         return 0;
     }
@@ -128,6 +129,8 @@ public static partial class Cli
             }
             case "check-config":
                 return await CheckConfigAsync(sp, db);
+            case "verify-data":
+                return await VerifyDataAsync(sp, db, args.Contains("--revoke-sessions"));
             default:
                 return 2;
         }
@@ -203,7 +206,14 @@ public static partial class Cli
         }
         Check(options.PublicOrigin.StartsWith("https://", StringComparison.Ordinal), "Origen público HTTPS");
         Check(await db.Database.CanConnectAsync(), "Conexión a PostgreSQL (rol runtime)");
-        Check(!(await db.Database.GetPendingMigrationsAsync()).Any(), "Sin migraciones pendientes");
+        try
+        {
+            Check(!(await db.Database.GetPendingMigrationsAsync()).Any(), "Sin migraciones pendientes");
+        }
+        catch (Npgsql.PostgresException ex)
+        {
+            Check(false, "Historial de migraciones legible: " + ex.SqlState);
+        }
         var keyDir = new DirectoryInfo(options.KeyRingPath);
         Check(keyDir.Exists, "Directorio del key ring presente");
         try
@@ -222,9 +232,63 @@ public static partial class Cli
             Check(!plain, "Claves del key ring cifradas con certificado");
         }
         Check(await db.Users.CountAsync() <= 1, "Un único propietario");
-        var owner = await db.Users.FirstOrDefaultAsync();
+        var owner = await db.Users.OrderBy(u => u.CreatedAt).FirstOrDefaultAsync();
         Check(owner is null || owner.TwoFactorEnabled, "Segundo factor configurado (o propietario aún no creado)");
         return ok ? 0 : 1;
+    }
+
+    /// <summary>
+    /// Verificación de restauración: conteos, sumas por moneda (enteros exactos), integridad de cuotas y que los secretos
+    /// TOTP se puedan descifrar con el key ring restaurado. Opcionalmente revoca todas las sesiones restauradas.
+    /// </summary>
+    private static async Task<int> VerifyDataAsync(IServiceProvider sp, AppDbContext db, bool revokeSessions)
+    {
+        var totp = sp.GetRequiredService<TotpService>();
+        var secrets = await db.Users.Where(u => u.TotpSecretProtected != null).Select(u => u.TotpSecretProtected!).ToListAsync();
+        var decryptable = 0;
+        foreach (var s in secrets)
+        {
+            try { _ = totp.Unprotect(s); decryptable++; } catch (System.Security.Cryptography.CryptographicException) { }
+        }
+        var sums = await db.Entries.Where(e => e.DeletedAt == null)
+            .GroupBy(e => new { e.Currency, e.Kind })
+            .Select(g => new { currency = g.Key.Currency.ToString(), kind = g.Key.Kind.ToString(), count = g.Count(), totalMinor = g.Sum(x => x.AmountMinor) })
+            .ToListAsync();
+        var planSums = await db.Plans.Where(p => p.DeletedAt == null)
+            .GroupBy(p => p.Currency)
+            .Select(g => new { currency = g.Key.ToString(), count = g.Count(), totalMinor = g.Sum(x => x.TotalMinor) })
+            .ToListAsync();
+        var badPlans = await db.Plans.CountAsync(p => p.TotalMinor != p.Installments.Sum(i => i.AmountMinor) || p.Count != p.Installments.Count());
+        var revoked = 0;
+        if (revokeSessions)
+        {
+            revoked = await db.Sessions.Where(s => s.RevokedAt == null).ExecuteUpdateAsync(u => u
+                .SetProperty(x => x.RevokedAt, DateTimeOffset.UtcNow).SetProperty(x => x.RevokedReason, "restore_test")
+                .SetProperty(x => x.ProtectedTicket, (byte[]?)null));
+        }
+        var report = new
+        {
+            counts = new
+            {
+                users = await db.Users.CountAsync(),
+                accounts = await db.Accounts.CountAsync(),
+                categories = await db.Categories.CountAsync(),
+                entries = await db.Entries.CountAsync(),
+                plans = await db.Plans.CountAsync(),
+                installments = await db.Installments.CountAsync(),
+                payments = await db.Payments.CountAsync(),
+                transfers = await db.Transfers.CountAsync(),
+                auditEvents = await db.AuditEvents.CountAsync(),
+            },
+            entrySums = sums,
+            planSums,
+            plansWithInconsistentInstallments = badPlans,
+            totpSecrets = secrets.Count,
+            totpDecryptable = decryptable,
+            sessionsRevoked = revoked,
+        };
+        Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(report, new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+        return badPlans == 0 && decryptable == secrets.Count ? 0 : 1;
     }
 
     private static string Prompt(string label)

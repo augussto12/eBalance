@@ -1,0 +1,136 @@
+# Álvarez Finanzas — producción (Docker Compose detrás del Nginx del host).
+# - db: sin puertos publicados; red interna sin salida a internet.
+# - api: sin puertos publicados; solo alcanzable por «web» dentro de Compose.
+# - web: publicado SOLO en loopback (WEB_BIND, por defecto 127.0.0.1:8088) para el Nginx del host.
+# Secretos: archivos montados de solo lectura (no es una bóveda cifrada). Ver docs/RUNBOOK.md.
+name: ${COMPOSE_PROJECT_NAME:-alvarez-finanzas}
+
+x-hardening: &hardening
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: ["ALL"]
+  restart: unless-stopped
+  logging:
+    driver: local
+    options: { max-size: "10m", max-file: "5" }
+
+services:
+  db:
+    <<: *hardening
+    image: postgres:18.6-alpine3.24
+    cap_add: ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"]
+    environment:
+      POSTGRES_USER: alvarez_admin
+      POSTGRES_DB: alvarez
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_admin_password
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256 --data-checksums"
+    secrets: [db_admin_password, db_app_password, db_migrator_password]
+    volumes:
+      - db-data:/var/lib/postgresql
+      - ./infra/docker/postgres/01-roles.sh:/docker-entrypoint-initdb.d/01-roles.sh:ro
+    shm_size: 128m
+    networks: [backend]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U alvarez_admin -d alvarez -q"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  migrate:
+    <<: *hardening
+    image: alvarez-finanzas-api:${IMAGE_TAG:-local}
+    profiles: ["ops"]
+    restart: "no"
+    command: ["migrate"]
+    read_only: true
+    tmpfs: ["/tmp:size=16m"]
+    environment:
+      ConnectionStrings__Migrator: "Host=db;Port=5432;Database=alvarez;Username=alvarez_migrator;Timeout=10;Gss Encryption Mode=Disable"
+      ConnectionStrings__MigratorPasswordFile: /run/secrets/db_migrator_password
+      App__RuntimeDbRole: alvarez_app
+    secrets: [db_migrator_password]
+    depends_on: { db: { condition: service_healthy } }
+    networks: [backend]
+
+  api:
+    <<: *hardening
+    image: alvarez-finanzas-api:${IMAGE_TAG:-local}
+    build:
+      context: .
+      dockerfile: infra/docker/api.Dockerfile
+    read_only: true
+    tmpfs: ["/tmp:size=32m"]
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      ConnectionStrings__App: "Host=db;Port=5432;Database=alvarez;Username=alvarez_app;Maximum Pool Size=20;Timeout=10;Gss Encryption Mode=Disable"
+      ConnectionStrings__AppPasswordFile: /run/secrets/db_app_password
+      App__PublicOrigin: ${PUBLIC_ORIGIN:?Definí PUBLIC_ORIGIN en .env}
+      App__DataProtectionApplicationName: alvarez-finanzas-production
+      App__KeyRingPath: /keys
+      # Directorio con current.pfx/current.password y, tras una rotación, previous-*.pfx/.password.
+      App__KeyRingCertificatePath: /run/keyring/current.pfx
+      App__KeyRingCertificatePasswordFile: /run/keyring/current.password
+      App__TrustedProxies: 172.30.57.10
+      App__EnableDemoData: "false"
+    secrets: [db_app_password]
+    volumes:
+      - keys:/keys
+      - ${SECRETS_DIR:-./secrets}/keyring:/run/keyring:ro
+    depends_on: { db: { condition: service_healthy } }
+    networks:
+      backend: {}
+      frontend: { ipv4_address: 172.30.57.11 }
+
+  web:
+    <<: *hardening
+    image: alvarez-finanzas-web:${IMAGE_TAG:-local}
+    build:
+      context: .
+      dockerfile: infra/docker/web.Dockerfile
+    read_only: true
+    tmpfs: ["/tmp:size=16m"]
+    ports:
+      - "${WEB_BIND:-127.0.0.1:8088}:8080"
+    depends_on: { api: { condition: service_healthy } }
+    networks:
+      frontend: { ipv4_address: 172.30.57.10 }
+
+  backup:
+    image: alvarez-finanzas-backup:${IMAGE_TAG:-local}
+    build:
+      context: .
+      dockerfile: infra/docker/backup.Dockerfile
+    profiles: ["ops"]
+    restart: "no"
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    # DAC_OVERRIDE: leer el key ring (uid 1654); CHOWN/FOWNER: restaurar conservando dueños y permisos.
+    cap_add: ["DAC_OVERRIDE", "CHOWN", "FOWNER"]
+    environment:
+      RESTIC_REPOSITORY: ${RESTIC_REPOSITORY:-/backups/restic}
+      RESTIC_CACHE_DIR: /tmp/restic-cache
+    secrets: [db_migrator_password, restic_password]
+    volumes:
+      - keys:/keys:ro
+      - ${BACKUP_DIR:-./backups}:/backups
+    tmpfs: ["/tmp:size=256m"]
+    depends_on: { db: { condition: service_healthy } }
+    networks: [backend, egress]
+
+networks:
+  backend:
+    internal: true
+  frontend:
+    ipam:
+      config:
+        - subnet: 172.30.57.0/24
+  egress: {}
+
+volumes:
+  db-data:
+  keys:
+
+secrets:
+  db_admin_password: { file: "${SECRETS_DIR:-./secrets}/db_admin_password" }
+  db_app_password: { file: "${SECRETS_DIR:-./secrets}/db_app_password" }
+  db_migrator_password: { file: "${SECRETS_DIR:-./secrets}/db_migrator_password" }
+  restic_password: { file: "${SECRETS_DIR:-./secrets}/restic_password" }

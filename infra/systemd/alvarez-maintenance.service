@@ -1,0 +1,9 @@
+[Unit]
+Description=Álvarez Finanzas — purga de auditoría vieja y verificación de TLS
+Wants=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/srv/alvarez-finanzas/app
+ExecStart=/srv/alvarez-finanzas/app/infra/scripts/maintenance.sh

@@ -1,0 +1,17 @@
+# Desarrollo local: solo PostgreSQL en loopback. La API corre con `dotnet run` y el frontend con `npm run dev`.
+# Contraseña de desarrollo NO secreta, válida solo para esta base local descartable.
+# Usar SIEMPRE con proyecto propio para no chocar con el de producción definido en .env:
+#   docker compose -p alvarez-finanzas-dev -f compose.dev.yaml up -d
+# El servicio se llama «devdb» (no «db») para que nunca reemplace al contenedor de producción.
+name: alvarez-finanzas-dev
+services:
+  devdb:
+    image: postgres:18.6-alpine3.24
+    environment:
+      POSTGRES_USER: alvarez_dev
+      POSTGRES_PASSWORD: solo-desarrollo-local
+      POSTGRES_DB: alvarez_dev
+    ports: ["127.0.0.1:5432:5432"]
+    volumes: ["dev-db:/var/lib/postgresql"]
+volumes:
+  dev-db:

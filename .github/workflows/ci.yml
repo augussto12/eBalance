@@ -1,0 +1,63 @@
+# CI: pruebas, build de imágenes, auditoría de dependencias y escaneo de secretos. Sin secretos productivos.
+name: ci
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-dotnet@v5
+        with:
+          global-json-file: global.json
+      - run: dotnet restore AlvarezFinanzas.slnx --locked-mode
+      - run: dotnet build AlvarezFinanzas.slnx --no-restore -c Release
+      - name: Pruebas unitarias
+        run: dotnet test --project tests/unit/AlvarezFinanzas.UnitTests -c Release --no-build
+      - name: Pruebas de integración (PostgreSQL real con Testcontainers)
+        run: dotnet test --project tests/integration/AlvarezFinanzas.IntegrationTests -c Release --no-build
+      - name: Dependencias NuGet vulnerables
+        run: |
+          dotnet list AlvarezFinanzas.slnx package --vulnerable --include-transitive | tee nuget-audit.txt
+          ! grep -q "has the following vulnerable packages" nuget-audit.txt
+
+  frontend:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: src/web
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24.22.1
+      - run: npm ci --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - name: Sin secretos en el bundle
+        run: |
+          ! grep -RInE "(password|secret|BEGIN [A-Z ]*PRIVATE KEY|ConnectionStrings)" dist/assets/*.js
+      - run: npm audit --audit-level=high
+
+  images:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - run: docker build -f infra/docker/api.Dockerfile -t alvarez-finanzas-api:ci .
+      - run: docker build -f infra/docker/web.Dockerfile -t alvarez-finanzas-web:ci .
+      - run: docker build -f infra/docker/backup.Dockerfile -t alvarez-finanzas-backup:ci .
+      - run: docker compose --env-file .env.example config -q
+
+  secrets:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: gitleaks (historial completo)
+        run: docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:v8.28.0 git /repo --redact --no-banner

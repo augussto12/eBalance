@@ -1,0 +1,13 @@
+# Backup diario cifrado. Instalar: sudo cp infra/systemd/alvarez-* /etc/systemd/system/ &&
+#   sudo systemctl daemon-reload && sudo systemctl enable --now alvarez-backup.timer alvarez-maintenance.timer
+# Ajustar WorkingDirectory a la ruta del repo en la VPS.
+[Unit]
+Description=Álvarez Finanzas — backup cifrado (restic)
+Wants=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/srv/alvarez-finanzas/app
+ExecStart=/srv/alvarez-finanzas/app/infra/scripts/backup.sh
+# Un fallo queda en el journal (systemctl --failed / journalctl -u alvarez-backup). Ver RUNBOOK: alertas.

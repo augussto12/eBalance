@@ -36,3 +36,6 @@ logs/
 .idea/
 *.user
 .DS_Store
+infra/e2e/rendered/
+tests/e2e/.e2e-state.json
+tests/e2e/test-results/

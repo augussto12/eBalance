@@ -1,44 +1,50 @@
-# Álvarez Finanzas — paquete de implementación para VS Code
+# Álvarez Finanzas
 
-Preparado el 20/10/2026. Idioma: español argentino. Propietario: Augusto.
+App personal de finanzas (un solo propietario) para registrar ingresos, gastos, compras en cuotas y préstamos, entender el mes y proyectar compromisos. Reproduce el diseño aprobado de `reference/` con React y guarda todo en PostgreSQL detrás de una API ASP.NET Core con login, segundo factor TOTP y sesiones revocables.
 
-## Qué contiene
+- **Estado real, pruebas y pendientes:** [docs/IMPLEMENTATION-STATUS.md](docs/IMPLEMENTATION-STATUS.md)
+- **Despliegue en la VPS, backups, restauración e incidentes:** [docs/RUNBOOK.md](docs/RUNBOOK.md)
+- **Versiones fijadas y cómo actualizarlas:** [docs/VERSIONES.md](docs/VERSIONES.md)
+- **Especificación original:** `docs/01`–`06`, `AGENTS.md`, `docs/00-PAQUETE-*`
+- **Comparación visual con el prototipo:** `docs/visual/` (capturas con datos ficticios)
 
-Este paquete es una especificación de implementación con el prototipo original incluido. **No es todavía la aplicación full-stack ni una implementación de las medidas de seguridad descritas.** El agente debe construirlas y verificarlas.
+## Estructura
 
-- `PROMPT-INICIAL.md`: texto para darle al agente de VS Code.
-- `AGENTS.md`: reglas del proyecto y definición de terminado.
-- `reference/`: HTML, CSS y JavaScript exactos del prototipo aprobado, sin credenciales ni datos financieros del usuario.
-- `docs/01-PRODUCTO-Y-DISENO.md`: comportamiento, alcance y fidelidad visual.
-- `docs/02-ARQUITECTURA-Y-DATOS.md`: arquitectura, reglas monetarias y API.
-- `docs/03-SEGURIDAD.md`: controles concretos y pruebas negativas.
-- `docs/04-VPS-Y-OPERACION.md`: despliegue, secretos, backups y recuperación.
-- `docs/05-PLAN-Y-ACEPTACION.md`: orden de implementación y casos verificables.
-- `docs/06-FUENTES.md`: documentación primaria para validar decisiones.
-- `SHA256SUMS.txt`: integridad de los archivos del paquete.
+```
+src/api/      API ASP.NET Core 10 (Domain / Application / Infrastructure / Api) + migraciones EF Core
+src/web/      React 19 + TypeScript + Vite (CSS original portado sin cambios en styles/reference.css)
+tests/unit/   reglas de dinero, calendario e importación (xUnit)
+tests/integration/  API completa contra PostgreSQL 18 real y efímero (Testcontainers)
+tests/e2e/    Playwright contra el stack Docker completo con TLS
+infra/        Dockerfiles, Nginx, scripts de operación, systemd, entorno E2E
+compose.yaml  producción (detrás del Nginx del host) · compose.dev.yaml desarrollo
+```
 
-## Cómo usarlo
+## Desarrollo local
 
-1. Descomprimir en una carpeta nueva y abrirla en VS Code.
-2. Dar al agente el contenido de `PROMPT-INICIAL.md` o pedirle que lo lea y ejecute.
-3. Mantener `reference/` como referencia visual; el código nuevo vive en `src/`, `tests/` e `infra/`.
-4. Revisar la primera pantalla contra el original antes de ampliar funciones.
-5. Probar localmente con datos ficticios. Usar datos reales solo cuando los controles y la recuperación estén implementados y verificados.
+Requisitos: .NET SDK 10.0.1xx o superior, Node 24 LTS (o ≥ 22.12), Docker.
 
-El prototipo puede verse con un servidor estático local desde `reference/`. Sus registros se guardan en localStorage y no son aptos como almacenamiento final. La app nueva debe guardar en PostgreSQL. La importación del respaldo del prototipo se hará por archivo explícito: el dominio de la VPS no puede leer el localStorage del sitio anterior.
+```bash
+docker compose -p alvarez-finanzas-dev -f compose.dev.yaml up -d   # PostgreSQL local (127.0.0.1:5432, contraseña de desarrollo no secreta)
+cd src/api/AlvarezFinanzas.Api
+ASPNETCORE_ENVIRONMENT=Development dotnet run -- migrate
+printf 'una contraseña de desarrollo larga\n' | ASPNETCORE_ENVIRONMENT=Development dotnet run -- bootstrap-owner --username dev --display-name "Dev Local"
+ASPNETCORE_ENVIRONMENT=Development ASPNETCORE_URLS=http://localhost:5080 dotnet run
+# en otra terminal
+cd src/web && npm ci && npm run dev               # https://localhost:5173 (certificado local autofirmado)
+```
 
-Sitio de referencia (privado): https://alvarez-finanzas.augustoalvarez10.chatgpt.site
-No depender del acceso a ese sitio: los tres archivos originales están incluidos.
+En desarrollo, el botón «Cargar ejemplo» (pie de página) agrega datos ficticios solo si `App:EnableDemoData=true` (ya activo en `appsettings.Development.json`). En producción ese endpoint no existe.
 
-## Decisiones ya tomadas
+## Pruebas
 
-- Diseño aprobado: oscuro con verde lima, tal como `reference/`; no rediseñar.
-- React + TypeScript para la interfaz; ASP.NET Core + EF Core + PostgreSQL para el servidor.
-- Despliegue Docker Compose detrás de Nginx en VPS propia.
-- Un propietario, sin registro público. Credenciales propias de la app; no depender de ChatGPT.
-- Cookies de sesión seguras y segundo factor TOTP, sin tokens en localStorage.
-- ARS y USD separados, sin cotización automática.
-- Sin conexión bancaria, scraping del home banking o lectura de correo en esta entrega.
-- Importación del JSON del prototipo en primera versión; CSV/PDF bancarios quedan para una fase posterior explícita.
+```bash
+dotnet test --project tests/unit/AlvarezFinanzas.UnitTests
+dotnet test --project tests/integration/AlvarezFinanzas.IntegrationTests   # requiere Docker
+cd src/web && npm test && npm run build
+./infra/e2e/run.sh                                  # stack completo + Playwright (ver infra/e2e/README.md)
+```
 
-El dominio final, los accesos a la VPS y los secretos no se conocen ni se incluyen. Usar placeholders y terminar la implementación antes de pedir esos datos para un despliegue real.
+## Producción (resumen)
+
+Ver [docs/RUNBOOK.md](docs/RUNBOOK.md). En corto: `cp .env.example .env` → `sudo ./infra/scripts/bootstrap-secrets.sh` → certificado TLS → `sudo ./infra/scripts/install-nginx-site.sh finanzas.tu-dominio` → `./infra/scripts/deploy.sh --first` → `./infra/scripts/bootstrap-owner.sh` → ingresar y configurar el autenticador → `./infra/scripts/backup.sh` y `./infra/scripts/restore-test.sh` **antes** de cargar datos reales.

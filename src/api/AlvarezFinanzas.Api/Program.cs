@@ -93,7 +93,19 @@ public partial class Program
                 ? null
                 : SecretFiles.Read(options.KeyRingCertificatePasswordFile, "contraseña del certificado del key ring");
             var cert = X509CertificateLoader.LoadPkcs12FromFile(options.KeyRingCertificatePath, password, X509KeyStorageFlags.EphemeralKeySet);
-            dp.ProtectKeysWithCertificate(cert).UnprotectKeysWithAnyCertificate(cert);
+            // Certificados anteriores (rotación): siguen pudiendo descifrar claves viejas, pero no cifran claves nuevas.
+            var all = new List<X509Certificate2> { cert };
+            var dir = Path.GetDirectoryName(options.KeyRingCertificatePath);
+            if (dir is not null && Directory.Exists(dir))
+            {
+                foreach (var previous in Directory.GetFiles(dir, "previous-*.pfx").Order(StringComparer.Ordinal))
+                {
+                    var pwFile = Path.ChangeExtension(previous, ".password");
+                    var pw = File.Exists(pwFile) ? SecretFiles.Read(pwFile, "contraseña de certificado anterior") : null;
+                    all.Add(X509CertificateLoader.LoadPkcs12FromFile(previous, pw, X509KeyStorageFlags.EphemeralKeySet));
+                }
+            }
+            dp.ProtectKeysWithCertificate(cert).UnprotectKeysWithAnyCertificate([.. all]);
         }
         else if (env.IsProduction())
         {
