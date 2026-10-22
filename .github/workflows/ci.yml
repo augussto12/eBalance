@@ -39,9 +39,9 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
-      - name: Sin secretos en el bundle
+      - name: Sin secretos ni configuración de servidor en el bundle
         run: |
-          ! grep -RInE "(password|secret|BEGIN [A-Z ]*PRIVATE KEY|ConnectionStrings)" dist/assets/*.js
+          ! grep -lE "BEGIN [A-Z ]*PRIVATE KEY|ConnectionStrings|Host=db|alvarez_app|alvarez_migrator|_password\b|restic|VITE_[A-Z_]+" dist/assets/*.js
       - run: npm audit --audit-level=high
 
   images:
