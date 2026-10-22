@@ -47,4 +47,13 @@ cd src/web && npm test && npm run build
 
 ## Producción (resumen)
 
-Ver [docs/RUNBOOK.md](docs/RUNBOOK.md). En corto: `cp .env.example .env` → `sudo ./infra/scripts/bootstrap-secrets.sh` → certificado TLS → `sudo ./infra/scripts/install-nginx-site.sh finanzas.tu-dominio` → `./infra/scripts/deploy.sh --first` → `./infra/scripts/bootstrap-owner.sh` → ingresar y configurar el autenticador → `./infra/scripts/backup.sh` y `./infra/scripts/restore-test.sh` **antes** de cargar datos reales.
+Ver [docs/RUNBOOK.md](docs/RUNBOOK.md). En la VPS, lo recomendado es el instalador (sirve también sin dominio: usa el nombre del proveedor o un certificado de Let's Encrypt para la IP):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/augussto12/eBalance/implementacion-v1/infra/scripts/vps-install.sh -o vps-install.sh
+sudo bash vps-install.sh --inspect                 # solo inspecciona; no cambia nada
+tmux new -s alvarez                                # sesión que sobrevive a un corte de SSH
+sudo bash vps-install.sh                           # instalación completa (dentro de tmux)
+```
+
+A mano: `cp .env.example .env` → `sudo ./infra/scripts/bootstrap-secrets.sh` → `sudo ./infra/scripts/install-nginx-site.sh --acme-only finanzas.tu-dominio` → `sudo ./infra/scripts/certbot.sh issue host finanzas.tu-dominio` → `sudo CERT_DIR=/etc/alvarez-finanzas/letsencrypt/live/alvarez-finanzas ./infra/scripts/install-nginx-site.sh finanzas.tu-dominio` → `./infra/scripts/deploy.sh --first` → `./infra/scripts/bootstrap-owner.sh` → ingresar y configurar el autenticador → `./infra/scripts/backup.sh` y `./infra/scripts/restore-test.sh` **antes** de cargar datos reales.

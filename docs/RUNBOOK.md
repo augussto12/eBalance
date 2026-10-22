@@ -15,7 +15,8 @@ Todos los comandos se probaron en un entorno local equivalente (Docker Compose +
 curl -fsSL https://raw.githubusercontent.com/augussto12/eBalance/implementacion-v1/infra/scripts/vps-install.sh -o vps-install.sh
 less vps-install.sh                 # revisalo
 sudo bash vps-install.sh --inspect  # solo inspecciona y reporta; no cambia nada
-tmux new -s alvarez 'sudo bash vps-install.sh'   # instalación completa (idempotente: se puede volver a correr)
+tmux new -s alvarez                 # sesión que sobrevive a un corte de SSH (si falta: apt install tmux)
+sudo bash vps-install.sh            # dentro de tmux: instalación completa (idempotente: se puede volver a correr)
 ```
 
 Para ejecutar exactamente lo que revisaste, fijá el commit: `sudo COMMIT=<sha> bash vps-install.sh`. El instalador verifica que el commit pertenezca a la rama y lo usa en modo *detached*. Dentro de `tmux`, un corte de SSH no interrumpe la instalación (`tmux attach -t alvarez` para volver).

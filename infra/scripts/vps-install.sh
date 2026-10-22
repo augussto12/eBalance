@@ -5,7 +5,8 @@
 #   curl -fsSL https://raw.githubusercontent.com/augussto12/eBalance/implementacion-v1/infra/scripts/vps-install.sh -o vps-install.sh
 #   less vps-install.sh                          # revisalo antes de ejecutarlo
 #   sudo bash vps-install.sh --inspect           # solo inspecciona (no cambia nada)
-#   tmux new -s alvarez 'sudo bash vps-install.sh'
+#   tmux new -s alvarez                          # sesión que sobrevive a un corte de SSH (tmux attach -t alvarez)
+#   sudo bash vps-install.sh                     # dentro de tmux
 #
 # Qué hace (idempotente: se puede volver a correr):
 #   1. Inspección SOLO LECTURA: puertos, Nginx, Docker, redes, firewall, memoria, disco. Si algo que no es Nginx

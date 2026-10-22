@@ -12,6 +12,8 @@ Verificadas el 22/10/2026 contra los registros oficiales (NuGet, npm, MCR, Docke
 | Nginx (contenedor web) | 1.30.6 (stable) | `nginxinc/nginx-unprivileged:1.30.6-alpine3.24` |
 | Node.js (build) | 24.22.1 LTS | `node:24.22.1-alpine3.24` |
 | restic | 0.19.1 | binario de `restic/restic:0.19.1` |
+| certbot (solo VPS, en contenedor) | 5.8.0 | `certbot/certbot:v5.8.0` fijado por digest en `infra/scripts/certbot.sh`; ≥ 5.4 es necesario para certificados de IP con webroot |
+| Nginx del host (VPS) | el de la distribución | Probado con 1.24.0 (Ubuntu 24.04): sin `http2 on;`, el instalador usa `listen 443 ssl http2` |
 
 ## Imágenes y digests observados
 
@@ -24,6 +26,7 @@ Verificadas el 22/10/2026 contra los registros oficiales (NuGet, npm, MCR, Docke
 | restic/restic:0.19.1 | sha256:136600b6ff6843d61d355f7f71f460a166429f35de6fd11b568fece3c9a4d510 |
 | mcr.microsoft.com/dotnet/aspnet:10.0.13-alpine3.24-extra | (no registrado: obtenerlo con `docker buildx imagetools inspect`) |
 | nginx:1.30.6-alpine3.24 (solo E2E) | sha256:47928bf67eb62a1863cb08d9ecb52d3e704304ba614eaee17884204677702951 |
+| certbot/certbot:v5.8.0 | sha256:f70ad0adbb7e117f0fe42a63c553f28ea451edabc0148757b6efcd9735acaa20 |
 
 Los Dockerfiles usan tags exactos. Para fijar por digest, reemplazar `imagen:tag` por `imagen:tag@sha256:…` en los `ARG` de `infra/docker/*.Dockerfile` y en `compose.yaml`.
 
@@ -45,7 +48,7 @@ E2E (`tests/e2e`): @playwright/test 1.64.1 · pngjs 7.0.0 · pixelmatch 8.0.0.
 
 ## Cómo actualizar
 
-1. Mensualmente (o ante un aviso de seguridad): revisar parches de .NET 10, PostgreSQL 18, Nginx stable y Alpine.
+1. Mensualmente (o ante un aviso de seguridad): revisar parches de .NET 10, PostgreSQL 18, Nginx stable, Alpine y certbot (`CERTBOT_IMAGE` en `infra/scripts/certbot.sh`, con su digest).
 2. Cambiar los tags/versiones, regenerar lockfiles (`dotnet restore --force-evaluate`, `npm install --save-exact`).
 3. Correr las pruebas unitarias, de integración y E2E, y el CI.
 4. Desplegar con `deploy.sh` (hace backup antes de migrar). Una versión mayor de PostgreSQL requiere dump/restore planificado, no un cambio de tag.

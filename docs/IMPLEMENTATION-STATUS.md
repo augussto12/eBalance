@@ -17,7 +17,7 @@ La app funciona de punta a punta en local sobre el stack de producción: TLS →
 | 3. Auth, MFA, sesiones, ownership, esquema | Hecha | 28 pruebas de integración contra PostgreSQL 18 real |
 | 4. CRUD, cuotas, pagos, transferencias, resumen, proyección | Hecha | Integración + E2E |
 | 5. Importación del prototipo y exportación/restauración versionada | Hecha | Integración + E2E |
-| 6. Endurecimiento, imágenes, Compose, Nginx, backup/restore, docs | Hecha en local | Scripts ejecutados (ver abajo); **despliegue en la VPS pendiente** |
+| 6. Endurecimiento, imágenes, Compose, Nginx, backup/restore, docs | Hecha en local | Scripts ejecutados (ver abajo). Instalador de la VPS probado en un entorno que la simula; **despliegue en la VPS real pendiente** |
 
 ## Comandos realmente ejecutados y resultados
 
@@ -40,6 +40,12 @@ La app funciona de punta a punta en local sobre el stack de producción: TLS →
 | `npm audit` (web y e2e) | 0 vulnerabilidades |
 | Modo desarrollo (`dotnet run` + `vite` con proxy) | Login por el proxy: OK |
 | GitHub Actions `ci` (run 39853251610) | backend, frontend, images y secrets: OK |
+| `vps-install.sh --inspect` y la instalación completa, en un entorno que simula la VPS (Ubuntu 24.04, nginx 1.24 del host, IP 31.97.241.220 redirigida a local con iptables, Pebble 2.10 como ACME) | OK, `TLS_MODE=auto` → IP. Certificado de IP (perfil `shortlived`) por http-01 con el sitio temporal, sitio final, build, migración, smoke tests, preflight con TLS **verificado** (cadena + IP), backup y restore-test (resultado=OK, 27 s). Re-ejecución sobre una instalación a medias y `--inspect` sobre una completa: OK. En `install.log` no hay montos ni secretos |
+| Verificación externa del sitio instalado | HTTP/2 200 con CSP; `http://` → 301 a `https://`; Host o SNI ajenos → 421; `/api/v1/entries` sin sesión → 401; web solo en `127.0.0.1:8088` |
+| `install-nginx-site.sh` con `nginx -t` fallido, con otro sitio roto y `--acme-only`/`--remove-acme` | Restaura el sitio anterior sin recargar; no toca nada si `nginx -t` ya fallaba; el sitio temporal responde antes de pedir el certificado |
+| `certbot.sh` (Pebble): cambio de IP del mismo linaje, renovación no vencida y renovación forzada | Reemplaza el certificado sin intervención; sin renovación no recarga Nginx; con renovación recarga una vez |
+| `maintenance.sh` sobre la instalación | OK (auditoría purgada, servicios healthy, TLS verificado, backup reciente) |
+| ShellCheck 0.11 sobre `infra/scripts` e `infra/e2e` | Sin advertencias (salvo SC2034 por variables compartidas en `lib.sh`) |
 
 ### Verificaciones de perímetro (stack local)
 
@@ -103,7 +109,7 @@ Diferencias **intencionales** respecto del prototipo:
 
 ## Pendiente / no probado (no marcar en verde)
 
-1. **Despliegue en la VPS:** nada se ejecutó allí. Falta: certificado Let's Encrypt real, `install-nginx-site.sh` sobre el Nginx existente, HSTS, `nmap` externo y medir RTO.
+1. **Despliegue en la VPS real:** nada se ejecutó allí todavía. Este entorno de desarrollo no tiene salida de red hacia la VPS, así que el instalador lo corre el propietario. Falta: el certificado de Let's Encrypt real (acá se usó Pebble, la CA de prueba oficial), la convivencia con los sitios reales del Nginx existente, el `nmap` externo y medir el RTO. HSTS solo si se usa un dominio propio dedicado.
 2. **Copia de backup fuera de la VPS** (`OFFSITE_RESTIC_REPOSITORY`): implementada, no probada. Falta elegir destino.
 3. CI: el primer run falló por un control demasiado ingenuo de «secretos en el bundle» (la palabra `password` de los formularios); se corrigió. El run 39853251610 pasó completo: backend, frontend, imágenes y gitleaks sobre todo el historial.
 4. `rotate-secrets.sh restic` y `db-migrator`: no ejecutados.
@@ -119,6 +125,16 @@ Diferencias **intencionales** respecto del prototipo:
 14. Fuera de alcance por especificación: CSV/PDF bancarios, notificaciones, tipos de cambio, presupuestos automáticos, recurrentes, passkeys.
 
 ## Bugs encontrados y corregidos durante la verificación
+
+Revisión adversarial del instalador de la VPS (multiagente, con verificación independiente de cada hallazgo):
+
+- Re-ejecutar el instalador, o `--inspect` después de instalar, siempre se detenía: los controles de convivencia detectaban el sitio propio, y el `# listen 443 ssl default_server` comentado del sitio default de Ubuntu bloqueaba el modo IP. Ahora se filtra por archivo y se ignoran los comentarios.
+- ufw abría el 80 recién después del desafío ACME. Ahora lo abre antes y `--inspect` avisa.
+- La contraseña del propietario se leía sin TTY por el `tee` del registro: no se ocultaba ni se pedía confirmación. Ahora se usa la terminal original y nada pasa por el registro.
+- El timer de renovación se instalaba al final; si algo fallaba antes, un certificado de ~6 días vencía sin renovarse. Ahora se instala apenas existe el certificado, y se comprueba que quedan al menos 72 h.
+- Si `nginx -t` fallaba, la configuración rota quedaba activa en el layout `conf.d`, o el sitio anterior se perdía con `--force`. Ahora hay respaldo y restauración.
+- El sitio temporal ACME escuchaba solo IPv4 y no se creaba si ya existía el sitio final para otro nombre. La detección del nombre del proveedor usaba `/etc/hosts` y la de subredes comparaba texto.
+- `restore-test.sh` dejaba conteos y sumas por moneda en `install.log`. La renovación recargaba Nginx dos veces por día sin cambios. `check_tls` miraba solo fechas.
 
 - Los tokens CSRF se emitían con identidad anónima en endpoints `AllowAnonymous`: se autentica explícitamente con el esquema combinado.
 - La reautenticación no rotaba la sesión (el handler de cookies reutiliza la clave): se emite una referencia nueva explícitamente.
