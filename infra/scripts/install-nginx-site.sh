@@ -5,7 +5,7 @@
 #   sudo ./infra/scripts/install-nginx-site.sh --acme-only NOMBRE      solo :80 para el desafío http-01 (temporal)
 #   sudo ./infra/scripts/install-nginx-site.sh --remove-acme           quita el sitio temporal
 # Variables: CERT_DIR (directorio con fullchain.pem/privkey.pem; por defecto /etc/letsencrypt/live/<nombre>),
-#            NO_IPV6=1 (omite «listen [::]»), DEFAULT_443=1 (certificado de IP: este sitio es el default del 443).
+#            NO_IPV6=1 (omite «listen [::]»), NO_IPV6_443=1 (solo omite [::]:443), DEFAULT_443=1 (certificado de IP: este sitio es el default del 443).
 source "$(dirname "$0")/lib.sh"
 load_env
 
@@ -84,7 +84,8 @@ bind="${WEB_BIND:-127.0.0.1:8088}"
 target="$avail/$site"
 rendered="$(mktemp)"; trap 'rm -f "$rendered"' EXIT
 extra=()
-if [[ -n "${NO_IPV6:-}" ]]; then extra=(-e '/listen \[::\]/d'); fi
+if [[ -n "${NO_IPV6:-}" ]]; then extra=(-e '/listen \[::\]/d')
+elif [[ -n "${NO_IPV6_443:-}" ]]; then extra=(-e '/listen \[::\]:443/d'); fi
 # «http2 on;» existe desde nginx 1.25.1; Ubuntu 24.04 trae 1.24 → se usa «listen 443 ssl http2».
 ngx_version="$(nginx -v 2>&1 | grep -o '[0-9][0-9.]*' | head -1 || true)"
 if [[ "$(printf '%s\n1.25.1\n' "$ngx_version" | sort -V | head -1)" != 1.25.1 ]]; then

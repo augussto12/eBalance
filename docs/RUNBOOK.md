@@ -39,6 +39,11 @@ Para ejecutar exactamente lo que revisaste, fijá el commit: `sudo COMMIT=<sha> 
 - La red `172.30.57.0/24` se superpone con otra red de Docker o con una ruta del host.
 - Otro proyecto renueva certificados con `certbot --standalone` y habría que instalar Nginx.
 - Hay menos de 2,5 GiB de memoria disponible (RAM + swap libres) para compilar. Se puede pasar por alto con `ALLOW_LOW_MEMORY=1`.
+- El servidor por defecto de Nginx publica rutas propias (por ejemplo `location /n8n/ { proxy_pass … }`), o `http(s)://` en la dirección elegida ya sirve otra cosa: este sitio se las tomaría. Solo después de revisarlo, `ALLOW_TAKEOVER=1`.
+- Docker instalado como snap, Podman en lugar de Docker, Docker anterior a la 23, o sin Compose v2/buildx disponibles. Tampoco sigue si hay un containerd de la distribución en uso sin Docker.
+- Menos de ~8 GiB libres en `/` para la primera instalación (~3 GiB en re-ejecuciones).
+
+`--inspect` informa **todos** los bloqueos de una vez y termina con código 1 si hay alguno. También avisa si otros servicios HTTPS de la VPS recibirían la cookie de sesión: no se aísla por puerto. La instalación espera a que apt quede libre (cloud-init, actualizaciones automáticas) y no desinstala paquetes de otros proyectos (`--no-remove`). Con un kernel sin IPv6, instala Nginx sin el `listen [::]` del sitio de serie. `listen [::]` se decide puerto por puerto.
 
 Las re-ejecuciones reconocen el sitio propio y mantienen la dirección guardada en `.env`. Para cambiarla, indicá `PUBLIC_HOST` o `TLS_MODE` explícitamente: el instalador emite el certificado nuevo y recién entonces actualiza `.env` y el sitio. Si ufw está activo, abre 80 y 443 **antes** del desafío ACME. El timer de renovación se instala apenas existe el certificado.
 

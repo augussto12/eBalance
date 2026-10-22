@@ -66,7 +66,7 @@ if [[ -n "${EXTRA_CA_FILE:-}" ]]; then
   [[ -n "${HTTPS_PROXY:-}" ]] && build_args+=(--build-arg "HTTPS_PROXY=$HTTPS_PROXY" --build-arg "NO_PROXY=${NO_PROXY:-}")
 fi
 for img in api web backup; do
-  docker build "${build_args[@]}" -f "infra/docker/$img.Dockerfile" -t "alvarez-finanzas-$img:$tag" .
+  DOCKER_BUILDKIT=1 docker build "${build_args[@]}" -f "infra/docker/$img.Dockerfile" -t "alvarez-finanzas-$img:$tag" .
 done
 
 if [[ "$mode" != --first ]]; then
