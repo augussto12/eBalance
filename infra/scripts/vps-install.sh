@@ -266,7 +266,7 @@ fi
 if [[ $HOST_NGINX -eq 0 ]] && grep -rqs '^authenticator = standalone' /etc/letsencrypt/renewal/; then
   die "Hay certificados de otros proyectos que se renuevan con certbot --standalone (puerto 80). Instalar Nginx los rompería. Mandame este reporte."
 fi
-echo "Dirección pública de la app: https://$PUBLIC_HOST"
+echo "Dirección pública de la app: https://$PUBLIC_HOST (modo TLS: $TLS_MODE)"
 if [[ $INSPECT -eq 1 ]]; then
   say "Inspección terminada: no se cambió nada. Si no hubo errores, podés correr la instalación completa."
   exit 0

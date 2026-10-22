@@ -59,9 +59,15 @@ previous="${IMAGE_TAG:-}"
 "$ROOT/infra/scripts/preflight.sh"
 
 info "Construyendo imágenes $tag"
-docker build -f infra/docker/api.Dockerfile -t "alvarez-finanzas-api:$tag" .
-docker build -f infra/docker/web.Dockerfile -t "alvarez-finanzas-web:$tag" .
-docker build -f infra/docker/backup.Dockerfile -t "alvarez-finanzas-backup:$tag" .
+# EXTRA_CA_FILE (opcional, igual que infra/e2e/build-images.sh): CA de un proxy TLS corporativo, solo en el build.
+build_args=()
+if [[ -n "${EXTRA_CA_FILE:-}" ]]; then
+  build_args+=(--network host --secret "id=extra_ca,src=$EXTRA_CA_FILE")
+  [[ -n "${HTTPS_PROXY:-}" ]] && build_args+=(--build-arg "HTTPS_PROXY=$HTTPS_PROXY" --build-arg "NO_PROXY=${NO_PROXY:-}")
+fi
+for img in api web backup; do
+  docker build "${build_args[@]}" -f "infra/docker/$img.Dockerfile" -t "alvarez-finanzas-$img:$tag" .
+done
 
 if [[ "$mode" != --first ]]; then
   info "Backup previo a la migración"
