@@ -45,6 +45,7 @@ La app funciona de punta a punta en local sobre el stack de producción: TLS →
 | `install-nginx-site.sh` con `nginx -t` fallido, con otro sitio roto y `--acme-only`/`--remove-acme` | Restaura el sitio anterior sin recargar; no toca nada si `nginx -t` ya fallaba; el sitio temporal responde antes de pedir el certificado |
 | `certbot.sh` (Pebble): cambio de IP del mismo linaje, renovación no vencida y renovación forzada | Reemplaza el certificado sin intervención; sin renovación no recarga Nginx; con renovación recarga una vez |
 | `maintenance.sh` sobre la instalación | OK (auditoría purgada, servicios healthy, TLS verificado, backup reciente) |
+| `vps-survey.sh` (relevamiento de solo lectura), con contenedores y archivos de prueba que llevan secretos falsos: variables de entorno, `.env`, labels basicauth de varios usuarios, remotos git con token, cron con `Bearer`/`-p`/`sshpass`, PEM multilínea | Ningún secreto aparece en el reporte. Con el daemon de Docker colgado termina en 12 s; Ctrl-C en una terminal real sale con 130 y borra el reporte incompleto. Probado con mawk, el awk por defecto de Ubuntu/Debian |
 | ShellCheck 0.11 sobre `infra/scripts` e `infra/e2e` | Sin advertencias (salvo SC2034 por variables compartidas en `lib.sh`) |
 
 ### Verificaciones de perímetro (stack local)
@@ -134,6 +135,17 @@ Revisión adversarial del instalador de la VPS (multiagente, con verificación i
 - El timer de renovación se instalaba al final; si algo fallaba antes, un certificado de ~6 días vencía sin renovarse. Ahora se instala apenas existe el certificado, y se comprueba que quedan al menos 72 h.
 - Si `nginx -t` fallaba, la configuración rota quedaba activa en el layout `conf.d`, o el sitio anterior se perdía con `--force`. Ahora hay respaldo y restauración.
 - El sitio temporal ACME escuchaba solo IPv4 y no se creaba si ya existía el sitio final para otro nombre. La detección del nombre del proveedor usaba `/etc/hosts` y la de subredes comparaba texto.
+- Segunda pasada: 14 de 64 hallazgos sobrevivieron a la verificación. Corregidos:
+  - El servidor por defecto de Nginx con rutas propias (`location /n8n/ { proxy_pass … }`) quedaba tomado sin aviso, y en modo nombre no había ninguna sonda.
+  - Variantes de Docker: snap, Podman, versiones anteriores a la 23 y falta de Compose v2/buildx.
+  - apt bloqueado por cloud-init, y `containerd.io` desinstalando en silencio el containerd de otro proyecto.
+  - Kernel sin IPv6, `listen [::]` por puerto y umbral de disco realista.
+- `vps-survey.sh`, con una revisión de cuatro enfoques (solo lectura, secretos, cobertura, portabilidad) y verificación de cada hallazgo. Se corrigió:
+  - Plantilla de `docker inspect` que perdía los contenedores con bind mounts.
+  - Llamadas a Docker sin tiempo máximo.
+  - Secretos que pasaban el filtro: `Authorization: Basic`, hashes htpasswd de varios usuarios, `-p`/`-u`/`sshpass` en cron, PEM multilínea.
+  - `certbot certificates` escribía logs.
+  - Traefik por archivo, NPM, Caddy con imports y Swarm no se veían.
 - `restore-test.sh` dejaba conteos y sumas por moneda en `install.log`. La renovación recargaba Nginx dos veces por día sin cambios. `check_tls` miraba solo fechas.
 
 - Los tokens CSRF se emitían con identidad anónima en endpoints `AllowAnonymous`: se autentica explícitamente con el esquema combinado.

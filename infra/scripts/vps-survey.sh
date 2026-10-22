@@ -28,7 +28,7 @@ s{\b(?:gh[pousr]_[A-Za-z0-9]{16,}|github_pat_\w{20,}|glpat-[\w-]{16,}|xox[abprs]
 s{\b\d{8,10}:[\w-]{30,}\b}{<redactado-token>}g;                                            # bots de Telegram
 s{(hooks\.slack\.com/services|discord(?:app)?\.com/api/webhooks)/\S+}{$1/<redactado>}gi;
 s{\$(?:apr1|2[abxy]|5|6|y|argon2\w*)\$[^\s"'"'"',;]+}{<redactado-hash>}g;                   # htpasswd / bcrypt / crypt
-s{(\s-u\s+|\s--user[ =])[^\s:]+:\S+}{$1<redactado>}g;                                       # curl -u usuario:clave
+s{(\s-u\s+|\s--user[ =])[^\s:]+:\S+}{$1<redactado>}g;                                       # credenciales de curl con -u o --user
 s{(\s--?(?:password|passwd|pass|pwd|token|secret|api-?key|auth-?token|access-?key)\b)(\s+|=)(?!-)\S+}{$1$2<redactado>}gi;
 s{(\bmysql(?:dump|admin)?\b[^\n]*?\s-p)(?!\s)\S+}{$1<redactado>}g;
 s{(\bsshpass\s+-p\s*)\S+}{$1<redactado>}g;
