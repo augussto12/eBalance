@@ -1,0 +1,3 @@
+# Falsos positivos verificados a mano (huella exacta de gitleaks; no desactiva ninguna regla).
+# Un comentario «curl -u usuario:clave» que describía una regla del filtro de redacción; se reescribió en fc7c872.
+1a5f0c1f9f1c51c9e63247d191f2fdd54f18c626:infra/scripts/vps-survey.sh:curl-auth-user:31
