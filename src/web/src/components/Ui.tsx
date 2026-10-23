@@ -4,6 +4,8 @@ import type { Me } from '../api/types';
 import type { Currency } from '../lib/money';
 import { currentMonth } from '../lib/dates';
 import { Modal } from './Modal';
+import { PasswordField } from './PasswordField';
+import { passwordTooLong } from '../lib/forms';
 import { RecordDialog, type RecordTarget } from './RecordForm';
 import { ApiError, api, resetCsrf } from '../api/client';
 
@@ -132,7 +134,7 @@ function ReauthDialog({ open, onDone }: { open: boolean; onDone: (ok: boolean) =
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (busy) return;
+    if (busy || passwordTooLong(password)) return;
     setBusy(true);
     setError(null);
     try {
@@ -152,10 +154,7 @@ function ReauthDialog({ open, onDone }: { open: boolean; onDone: (ok: boolean) =
     <Modal open={open} title="Confirmá que sos vos" onClose={() => onDone(false)} busy={busy}>
       <form onSubmit={submit} noValidate>
         <p className="hint">Para esta acción pedimos tu contraseña y un código de tu app autenticadora. La confirmación dura unos minutos.</p>
-        <label>
-          Contraseña
-          <input type="password" autoComplete="current-password" value={password} onChange={(e) => setPassword(e.target.value)} required maxLength={128} />
-        </label>
+        <PasswordField label="Contraseña" autoComplete="current-password" value={password} onChange={setPassword} />
         <label>
           Código de 6 dígitos
           <input inputMode="numeric" autoComplete="one-time-code" className="otp" value={code} onChange={(e) => setCode(e.target.value)} required maxLength={7} />

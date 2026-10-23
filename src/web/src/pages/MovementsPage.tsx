@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { keepPreviousData, useQuery } from '@tanstack/react-query';
 import { api } from '../api/client';
 import type { Occurrence, Page } from '../api/types';
-import { OccurrenceTable, QueryState } from '../components/Records';
+import { OccurrenceTable, QueryState, RefetchError } from '../components/Records';
 import { useUi } from '../components/Ui';
 
 const PAGE_SIZE = 25;
@@ -48,6 +48,7 @@ export function MovementsPage() {
       </div>
       {q.data ? (
         <>
+          <RefetchError error={q.error} retrying={q.isFetching} onRetry={() => q.refetch()} />
           {q.data.total === 0 && (debounced || type !== 'all') ? (
             <div className="empty">No hay movimientos que coincidan con la búsqueda.</div>
           ) : (

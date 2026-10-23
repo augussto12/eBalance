@@ -3,11 +3,13 @@ import { useLocation } from 'react-router';
 import { useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query';
 import { ApiError, api, download, idempotencyKey, resetCsrf } from '../api/client';
 import type { Account, AccountKind, Category, ImportPreview, Me, SessionInfo, Transfer, TrashItem } from '../api/types';
-import { FieldError } from '../components/Modal';
-import { QueryState } from '../components/Records';
+import { Modal, useFieldErrors } from '../components/Modal';
+import { PasswordField } from '../components/PasswordField';
+import { QueryState, RefetchError } from '../components/Records';
 import { useUi } from '../components/Ui';
 import { formatDate, formatDateTime, todayIso } from '../lib/dates';
 import { formatMoney, minorToInput, parseAmountInput, type Currency } from '../lib/money';
+import { hasErrors, newPasswordErrors, passwordTooLong, problemErrors, type FieldErrors } from '../lib/forms';
 import { invalidateFinancial, signOutLocally, useAccounts, useCategories } from './queries';
 
 const KIND_LABEL: Record<AccountKind, string> = { cash: 'Efectivo', bank: 'Banco', wallet: 'Billetera virtual', credit_card: 'Tarjeta de crédito' };
@@ -58,15 +60,20 @@ function Profile({ me }: { me: Me }) {
   const { toast } = useUi();
   const [name, setName] = useState(me.user?.displayName ?? '');
   const [error, setError] = useState<string | null>(null);
+  const [errors, setErrors] = useState<FieldErrors<'displayName'>>({});
+  const fe = useFieldErrors(errors);
   const save = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
+    setErrors({});
     try {
       await api('PATCH', '/auth/me', { displayName: name, version: me.user?.version });
       await qc.invalidateQueries({ queryKey: ['me'] });
       toast('Perfil actualizado');
     } catch (err) {
-      setError(errorText(err, 'No se pudo guardar.'));
+      const r = problemErrors(err, { displayName: 'displayName' }, 'No se pudo guardar.');
+      setErrors(r.fields);
+      setError(r.form);
     }
   };
   return (
@@ -76,7 +83,8 @@ function Profile({ me }: { me: Me }) {
       <form className="inline" onSubmit={save}>
         <label>
           Nombre para mostrar
-          <input value={name} maxLength={60} onChange={(e) => setName(e.target.value)} required />
+          <input value={name} maxLength={60} onChange={(e) => setName(e.target.value)} required {...fe.props('displayName')} />
+          {fe.error('displayName')}
         </label>
         <button className="primary">Guardar</button>
       </form>
@@ -92,19 +100,24 @@ function Accounts() {
   const [name, setName] = useState('');
   const [kind, setKind] = useState<AccountKind>('bank');
   const [currency, setCurrency] = useState<Currency>('ARS');
-  const [errors, setErrors] = useState<Record<string, string[]>>({});
+  const [errors, setErrors] = useState<FieldErrors<'name' | 'kind' | 'currency'>>({});
+  const [formError, setFormError] = useState<string | null>(null);
+  const fe = useFieldErrors(errors);
   const [editing, setEditing] = useState<Account | null>(null);
 
   const create = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrors({});
+    setFormError(null);
     try {
       await api('POST', '/accounts', { name: name.trim(), kind, currency });
       setName('');
       await invalidateFinancial(qc);
       toast('Cuenta creada');
     } catch (err) {
-      setErrors(err instanceof ApiError ? { ...err.fieldErrors, form: [err.title] } : { form: ['No se pudo crear.'] });
+      const r = problemErrors(err, { name: 'name', kind: 'kind', currency: 'currency' }, 'No se pudo crear.');
+      setErrors(r.fields);
+      setFormError(r.form);
     }
   };
 
@@ -152,15 +165,15 @@ function Accounts() {
           </div>
         )
       ) : <QueryState isPending={accounts.isPending} error={accounts.error} onRetry={() => accounts.refetch()} />}
+      {accounts.data && <RefetchError error={accounts.error} retrying={accounts.isFetching} onRetry={() => accounts.refetch()} />}
       {editing && <AccountEditor account={editing} onDone={() => setEditing(null)} />}
       <form className="inline" onSubmit={create}>
-        <label>Nombre<input value={name} maxLength={60} onChange={(e) => setName(e.target.value)} placeholder="Ej. Mercado Pago" aria-invalid={errors.name ? true : undefined} /></label>
-        <label>Tipo<select value={kind} onChange={(e) => setKind(e.target.value as AccountKind)}>{Object.entries(KIND_LABEL).map(([k, l]) => <option key={k} value={k}>{l}</option>)}</select></label>
-        <label>Moneda<select value={currency} onChange={(e) => setCurrency(e.target.value as Currency)}><option>ARS</option><option>USD</option></select></label>
+        <label>Nombre<input value={name} maxLength={60} onChange={(e) => setName(e.target.value)} placeholder="Ej. Mercado Pago" {...fe.props('name')} />{fe.error('name')}</label>
+        <label>Tipo<select value={kind} onChange={(e) => setKind(e.target.value as AccountKind)} {...fe.props('kind')}>{Object.entries(KIND_LABEL).map(([k, l]) => <option key={k} value={k}>{l}</option>)}</select>{fe.error('kind')}</label>
+        <label>Moneda<select value={currency} onChange={(e) => setCurrency(e.target.value as Currency)} {...fe.props('currency')}><option>ARS</option><option>USD</option></select>{fe.error('currency')}</label>
         <button>＋ Agregar cuenta</button>
       </form>
-      <FieldError id="err-account-name" errors={errors.name} />
-      {errors.form && <p className="formerror" role="alert">{errors.form.join(' ')}</p>}
+      {formError && <p className="formerror" role="alert">{formError}</p>}
     </section>
   );
 }
@@ -174,15 +187,18 @@ function AccountEditor({ account, onDone }: { account: Account; onDone: () => vo
   const [negative, setNegative] = useState(account.openingBalanceMinor?.startsWith('-') ?? false);
   const [openingDate, setOpeningDate] = useState(account.openingDate ?? todayIso());
   const [error, setError] = useState<string | null>(null);
+  const [errors, setErrors] = useState<FieldErrors<'name' | 'last4' | 'opening' | 'openingDate'>>({});
+  const fe = useFieldErrors(errors);
   const save = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
+    setErrors({});
     let openingMinor: string | null = null;
     if (opening.trim() && account.kind !== 'credit_card') {
       if (opening.trim() === '0') openingMinor = '0';
       else {
         const p = parseAmountInput(opening);
-        if (!p.ok) return setError(p.error);
+        if (!p.ok) return setErrors({ opening: [p.error] });
         openingMinor = (negative ? '-' : '') + p.minor;
       }
     }
@@ -195,21 +211,23 @@ function AccountEditor({ account, onDone }: { account: Account; onDone: () => vo
       toast('Cuenta actualizada');
       onDone();
     } catch (err) {
-      setError(errorText(err, 'No se pudo guardar.'));
+      const r = problemErrors(err, { name: 'name', last4: 'last4', openingBalanceMinor: 'opening', openingDate: 'openingDate' }, 'No se pudo guardar.');
+      setErrors(r.fields);
+      setError(r.form);
     }
   };
   return (
     <form className="preview" onSubmit={save}>
       <strong>Editar «{account.name}»</strong>
       <div className="inline">
-        <label>Nombre<input value={name} maxLength={60} onChange={(e) => setName(e.target.value)} /></label>
-        <label>Últimos 4 (opcional)<input value={last4} inputMode="numeric" maxLength={4} onChange={(e) => setLast4(e.target.value)} /></label>
+        <label>Nombre<input value={name} maxLength={60} onChange={(e) => setName(e.target.value)} {...fe.props('name')} />{fe.error('name')}</label>
+        <label>Últimos 4 (opcional)<input value={last4} inputMode="numeric" maxLength={4} onChange={(e) => setLast4(e.target.value)} {...fe.props('last4')} />{fe.error('last4')}</label>
       </div>
       {account.kind !== 'credit_card' && (
         <div className="inline">
-          <label>Saldo inicial<input inputMode="decimal" value={opening} onChange={(e) => setOpening(e.target.value)} placeholder="Dejar vacío si no lo sabés" /></label>
+          <label>Saldo inicial<input inputMode="decimal" value={opening} onChange={(e) => setOpening(e.target.value)} placeholder="Dejar vacío si no lo sabés" {...fe.props('opening')} />{fe.error('opening')}</label>
           <label className="check"><input type="checkbox" checked={negative} onChange={(e) => setNegative(e.target.checked)} />Negativo</label>
-          <label>A la fecha<input type="date" value={openingDate} onChange={(e) => setOpeningDate(e.target.value)} /></label>
+          <label>A la fecha<input type="date" value={openingDate} onChange={(e) => setOpeningDate(e.target.value)} {...fe.props('openingDate')} />{fe.error('openingDate')}</label>
         </div>
       )}
       {error && <p className="formerror" role="alert">{error}</p>}
@@ -224,15 +242,20 @@ function Categories() {
   const categories = useCategories();
   const [name, setName] = useState('');
   const [error, setError] = useState<string | null>(null);
+  const [errors, setErrors] = useState<FieldErrors<'name'>>({});
+  const fe = useFieldErrors(errors);
   const create = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
+    setErrors({});
     try {
       await api('POST', '/categories', { name: name.trim() });
       setName('');
       await invalidateFinancial(qc);
     } catch (err) {
-      setError(errorText(err, 'No se pudo crear.'));
+      const r = problemErrors(err, { name: 'name' }, 'No se pudo crear.');
+      setErrors(r.fields);
+      setError(r.form);
     }
   };
   const archive = async (c: Category) => {
@@ -251,8 +274,9 @@ function Categories() {
       {categories.data ? categories.data.map((c) => (
         <div className="kv" key={c.id}><span className="badge">{c.name}</span><button className="delete" aria-label={`Archivar ${c.name}`} onClick={() => archive(c)}>×</button></div>
       )) : <QueryState isPending={categories.isPending} error={categories.error} onRetry={() => categories.refetch()} />}
+      {categories.data && <RefetchError error={categories.error} retrying={categories.isFetching} onRetry={() => categories.refetch()} />}
       <form className="inline" onSubmit={create}>
-        <label>Nueva categoría<input value={name} maxLength={40} onChange={(e) => setName(e.target.value)} /></label>
+        <label>Nueva categoría<input value={name} maxLength={40} onChange={(e) => setName(e.target.value)} {...fe.props('name')} />{fe.error('name')}</label>
         <button>＋ Agregar</button>
       </form>
       {error && <p className="formerror" role="alert">{error}</p>}
@@ -269,7 +293,9 @@ function Transfers() {
   const [to, setTo] = useState('');
   const [amount, setAmount] = useState('');
   const [date, setDate] = useState(todayIso());
-  const [errors, setErrors] = useState<Record<string, string[]>>({});
+  const [errors, setErrors] = useState<FieldErrors<'from' | 'to' | 'amount' | 'date'>>({});
+  const [formError, setFormError] = useState<string | null>(null);
+  const fe = useFieldErrors(errors);
   const [busy, setBusy] = useState(false);
   const cash = (accounts.data ?? []).filter((a) => a.kind !== 'credit_card');
   const fromAccount = cash.find((a) => a.id === from);
@@ -277,8 +303,12 @@ function Transfers() {
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (busy) return;
+    setFormError(null);
     const p = parseAmountInput(amount);
-    if (!p.ok) return setErrors({ amountMinor: [p.error] });
+    const errs: FieldErrors<'amount' | 'date'> = {};
+    if (!p.ok) errs.amount = [p.error];
+    if (!date) errs.date = ['La fecha no es válida.'];
+    if (!p.ok || hasErrors(errs)) return setErrors(errs);
     setBusy(true);
     setErrors({});
     try {
@@ -287,7 +317,10 @@ function Transfers() {
       await invalidateFinancial(qc);
       toast('Transferencia registrada');
     } catch (err) {
-      setErrors(err instanceof ApiError ? { ...err.fieldErrors, form: [err.title] } : { form: ['No se pudo registrar.'] });
+      // La moneda sale de la cuenta de origen: su error se muestra en «Desde».
+      const r = problemErrors(err, { fromAccountId: 'from', currency: 'from', toAccountId: 'to', amountMinor: 'amount', date: 'date' }, 'No se pudo registrar.');
+      setErrors(r.fields);
+      setFormError(r.form);
     } finally {
       setBusy(false);
     }
@@ -307,16 +340,19 @@ function Transfers() {
       <p>No son ingresos ni gastos: solo mueven saldo entre cuentas propias de la misma moneda.</p>
       <form onSubmit={submit} noValidate>
         <div className="fields">
-          <label>Desde<select value={from} onChange={(e) => setFrom(e.target.value)} aria-invalid={errors.fromAccountId ? true : undefined}><option value="">Elegí…</option>{cash.map((a) => <option key={a.id} value={a.id}>{a.name} ({a.currency})</option>)}</select><FieldError id="err-tr-from" errors={errors.fromAccountId} /></label>
-          <label>Hacia<select value={to} onChange={(e) => setTo(e.target.value)} aria-invalid={errors.toAccountId ? true : undefined}><option value="">Elegí…</option>{cash.filter((a) => !fromAccount || a.currency === fromAccount.currency).map((a) => <option key={a.id} value={a.id}>{a.name} ({a.currency})</option>)}</select><FieldError id="err-tr-to" errors={errors.toAccountId} /></label>
+          <label>Desde<select value={from} onChange={(e) => setFrom(e.target.value)} {...fe.props('from')}><option value="">Elegí…</option>{cash.map((a) => <option key={a.id} value={a.id}>{a.name} ({a.currency})</option>)}</select>{fe.error('from')}</label>
+          <label>Hacia<select value={to} onChange={(e) => setTo(e.target.value)} {...fe.props('to')}><option value="">Elegí…</option>{cash.filter((a) => !fromAccount || a.currency === fromAccount.currency).map((a) => <option key={a.id} value={a.id}>{a.name} ({a.currency})</option>)}</select>{fe.error('to')}</label>
         </div>
         <div className="fields">
-          <label>Importe<input inputMode="decimal" value={amount} onChange={(e) => setAmount(e.target.value)} aria-invalid={errors.amountMinor ? true : undefined} /><FieldError id="err-tr-amount" errors={errors.amountMinor} /></label>
-          <label>Fecha<input type="date" value={date} onChange={(e) => setDate(e.target.value)} /></label>
+          <label>Importe<input inputMode="decimal" value={amount} onChange={(e) => setAmount(e.target.value)} {...fe.props('amount')} />{fe.error('amount')}</label>
+          <label>Fecha<input type="date" value={date} onChange={(e) => setDate(e.target.value)} {...fe.props('date')} />{fe.error('date')}</label>
         </div>
-        {errors.form && <p className="formerror" role="alert">{errors.form.join(' ')}</p>}
+        {formError && <p className="formerror" role="alert">{formError}</p>}
         <button disabled={busy}>Registrar transferencia</button>
       </form>
+      {transfers.data
+        ? <RefetchError error={transfers.error} retrying={transfers.isFetching} onRetry={() => transfers.refetch()} />
+        : <QueryState isPending={transfers.isPending} error={transfers.error} onRetry={() => transfers.refetch()} />}
       {transfers.data?.slice(0, 8).map((t) => (
         <div className="kv" key={t.id}>
           <span>{formatDate(t.date)} · {t.fromAccountName} → {t.toAccountName}</span>
@@ -333,7 +369,13 @@ function Security({ me }: { me: Me }) {
   const sessions = useQuery({ queryKey: ['sessions'], queryFn: () => api<SessionInfo[]>('GET', '/auth/sessions') });
   const [codes, setCodes] = useState<string[] | null>(null);
   const [pwd, setPwd] = useState({ current: '', next: '', repeat: '' });
+  const [pwdErrors, setPwdErrors] = useState<FieldErrors<'current' | 'next' | 'repeat'>>({});
   const [pwdError, setPwdError] = useState<string | null>(null);
+  /** Al editar un campo se borra su error anterior (el de longitud máxima lo recalcula PasswordField en el momento). */
+  const setPwdField = (k: 'current' | 'next' | 'repeat') => (v: string) => {
+    setPwd((p) => ({ ...p, [k]: v }));
+    setPwdErrors((e) => ({ ...e, [k]: undefined }));
+  };
 
   const elevated = () => me.elevatedUntil && new Date(me.elevatedUntil).getTime() > Date.now() + 15_000;
   const withReauth = async (fn: () => Promise<void>) => {
@@ -367,9 +409,11 @@ function Security({ me }: { me: Me }) {
   const changePassword = async (e: React.FormEvent) => {
     e.preventDefault();
     setPwdError(null);
-    if (pwd.next.length < 15) return setPwdError('La contraseña nueva debe tener al menos 15 caracteres.');
-    if (pwd.next.length > 128) return setPwdError('La contraseña admite hasta 128 caracteres.');
-    if (pwd.next !== pwd.repeat) return setPwdError('Las contraseñas nuevas no coinciden.');
+    // Sin maxLength en los campos (no se recorta lo pegado): las longitudes se validan acá y junto a cada campo.
+    const currentError = !pwd.current ? 'Ingresá tu contraseña actual.' : passwordTooLong(pwd.current);
+    const errs: FieldErrors<'current' | 'next' | 'repeat'> = { ...newPasswordErrors(pwd.next, pwd.repeat), ...(currentError ? { current: [currentError] } : {}) };
+    setPwdErrors(errs);
+    if (hasErrors(errs)) return;
     try {
       await withReauth(async () => {
         await api('POST', '/auth/password/change', { currentPassword: pwd.current, newPassword: pwd.next });
@@ -377,7 +421,9 @@ function Security({ me }: { me: Me }) {
       setPwd({ current: '', next: '', repeat: '' });
       goToLogin();
     } catch (err) {
-      setPwdError(errorText(err, 'No se pudo cambiar la contraseña.'));
+      const r = problemErrors(err, { currentPassword: 'current', newPassword: 'next' }, 'No se pudo cambiar la contraseña.');
+      setPwdErrors(r.fields);
+      setPwdError(r.form);
     }
   };
   const regenerate = async () => {
@@ -407,10 +453,10 @@ function Security({ me }: { me: Me }) {
       <h2>Seguridad</h2>
       <p>Cambiar la contraseña o el autenticador pide confirmar tu identidad y cierra todas las sesiones.</p>
       <form onSubmit={changePassword} noValidate>
-        <label>Contraseña actual<input type="password" autoComplete="current-password" maxLength={128} value={pwd.current} onChange={(e) => setPwd({ ...pwd, current: e.target.value })} /></label>
+        <PasswordField label="Contraseña actual" autoComplete="current-password" value={pwd.current} onChange={setPwdField('current')} errors={pwdErrors.current} />
         <div className="fields">
-          <label>Nueva (15 a 128 caracteres)<input type="password" autoComplete="new-password" maxLength={128} value={pwd.next} onChange={(e) => setPwd({ ...pwd, next: e.target.value })} /></label>
-          <label>Repetila<input type="password" autoComplete="new-password" maxLength={128} value={pwd.repeat} onChange={(e) => setPwd({ ...pwd, repeat: e.target.value })} /></label>
+          <PasswordField label="Nueva (15 a 128 caracteres)" autoComplete="new-password" value={pwd.next} onChange={setPwdField('next')} errors={pwdErrors.next} />
+          <PasswordField label="Repetila" autoComplete="new-password" value={pwd.repeat} onChange={setPwdField('repeat')} errors={pwdErrors.repeat} />
         </div>
         {pwdError && <p className="formerror" role="alert">{pwdError}</p>}
         <button>Cambiar contraseña</button>
@@ -428,6 +474,7 @@ function Security({ me }: { me: Me }) {
           {!s.current && <button className="delete" onClick={() => revoke(s)}>Cerrar</button>}
         </div>
       )) : <QueryState isPending={sessions.isPending} error={sessions.error} onRetry={() => sessions.refetch()} />}
+      {sessions.data && <RefetchError error={sessions.error} retrying={sessions.isFetching} onRetry={() => sessions.refetch()} />}
       <div className="actions"><button onClick={logoutAll}>Cerrar todas las sesiones</button></div>
     </section>
   );
@@ -456,6 +503,83 @@ export function RecoveryCodes({ codes, onDone }: { codes: string[]; onDone: () =
   );
 }
 
+/** Errores de lectura o de importación (los primeros 12). */
+function ImportErrors({ errors }: { errors: string[] }) {
+  if (errors.length === 0) return null;
+  return <div className="notice danger" role="alert">{errors.slice(0, 12).map((e, i) => <div key={i}>{e}</div>)}</div>;
+}
+
+/**
+ * Confirmación de importación en el modal accesible de la app (foco atrapado, Escape, foco devuelto al cerrar):
+ * nada se guarda hasta «Confirmar importación».
+ */
+export function ImportConfirmDialog({ preview, kinds, onKindsChange, busy, errors, onCancel, onConfirm }: {
+  preview: ImportPreview | null;
+  kinds: Record<string, AccountKind>;
+  onKindsChange: (kinds: Record<string, AccountKind>) => void;
+  busy: boolean;
+  errors: string[];
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  return (
+    <Modal open={preview !== null} title="Confirmar importación" onClose={onCancel} busy={busy}>
+      {preview && (
+        <div className="preview importpreview">
+          <strong>Vista previa ({preview.summary.format === 'legacy-v1' ? 'respaldo del prototipo' : 'exportación de esta app'})</strong>
+          <div>{preview.summary.total} registros: {preview.summary.new} nuevos, {preview.summary.duplicates} ya importados, {preview.summary.conflicts} en conflicto.</div>
+          <div>Por moneda: {Object.entries(preview.summary.byCurrency).map(([c, n]) => `${c} ${n}`).join(' · ')}. Las monedas no se suman entre sí.</div>
+          {preview.warnings.map((w) => <div key={w} className="notice warn">{w}</div>)}
+          {preview.conflicts.length > 0 && <div className="notice warn">Con contenido distinto al ya importado (no se sobrescriben): {preview.conflicts.map((c) => c.concept ?? c.sourceId).join(', ')}</div>}
+          {preview.accountsToCreate.length > 0 && (
+            <>
+              <div>Cuentas nuevas a crear (elegí el tipo):</div>
+              {preview.accountsToCreate.map((a) => (
+                <div className="inline" key={a.key}>
+                  <label>{a.name} ({a.currency})
+                    <select value={kinds[a.key] ?? 'bank'} onChange={(e) => onKindsChange({ ...kinds, [a.key]: e.target.value as AccountKind })}>
+                      {Object.entries(KIND_LABEL).map(([k, l]) => <option key={k} value={k}>{l}</option>)}
+                    </select>
+                  </label>
+                </div>
+              ))}
+            </>
+          )}
+          {preview.categoriesToCreate.length > 0 && <div>Categorías nuevas: {preview.categoriesToCreate.join(', ')}</div>}
+          <div className="tablewrap">
+            <table>
+              <thead><tr><th>Concepto</th><th>Tipo</th><th>Fecha</th><th>Cuenta</th><th className="num">Importe total</th></tr></thead>
+              <tbody>
+                {preview.sample.map((s, i) => (
+                  <tr key={i}>
+                    <td>{s.concept}</td>
+                    <td>{s.type}{s.count && s.count !== '1' ? ` · ${s.count} cuotas` : ''}</td>
+                    <td>{s.date ? formatDate(s.date) : ''}</td>
+                    <td>{s.account ?? 'Sin especificar'}</td>
+                    <td className="num">{s.amountMinor && s.currency ? formatMoney(s.amountMinor, s.currency as Currency) : ''}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <p className="hint">
+            {preview.summary.new === 0
+              ? 'No hay registros nuevos para importar: todo ya estaba importado o está en conflicto.'
+              : `Al confirmar se crean ${preview.summary.new} registros nuevos en una sola operación. Los ya importados y los que están en conflicto no se modifican.`}
+          </p>
+          <ImportErrors errors={errors} />
+          <div className="actions">
+            <button type="button" onClick={onCancel} disabled={busy} data-autofocus={preview.summary.new === 0 ? true : undefined}>Cancelar</button>
+            <button type="button" className="primary" onClick={onConfirm} disabled={busy || preview.summary.new === 0} data-autofocus={preview.summary.new === 0 ? undefined : true}>
+              {busy ? 'Importando…' : 'Confirmar importación'}
+            </button>
+          </div>
+        </div>
+      )}
+    </Modal>
+  );
+}
+
 function Backup() {
   const qc = useQueryClient();
   const { toast, reauth, me } = useUi();
@@ -466,10 +590,27 @@ function Backup() {
   const [busy, setBusy] = useState(false);
   const [commitKey, setCommitKey] = useState(idempotencyKey);
   const location = useLocation();
+  const importButton = useRef<HTMLButtonElement>(null);
+  const hadPreview = useRef(false);
 
   useEffect(() => {
     if (location.hash === '#importar') fileRef.current?.focus();
   }, [location.hash]);
+
+  // Al cerrar el modal de confirmación el foco vuelve a «Importar respaldo» (mientras se leía el archivo estaba
+  // deshabilitado, así que el modal no tiene a quién devolverlo).
+  useEffect(() => {
+    if (preview) hadPreview.current = true;
+    else if (hadPreview.current) {
+      hadPreview.current = false;
+      importButton.current?.focus();
+    }
+  }, [preview]);
+
+  const closePreview = () => {
+    setPreview(null);
+    setErrors([]);
+  };
 
   const exportAll = async () => {
     const elevated = me.elevatedUntil && new Date(me.elevatedUntil).getTime() > Date.now() + 15_000;
@@ -530,55 +671,12 @@ function Backup() {
         <button onClick={exportAll}>↓ Exportar respaldo completo</button>
         <label className="sr-only" htmlFor="importfile">Archivo de respaldo</label>
         <input ref={fileRef} id="importfile" type="file" accept="application/json,.json" hidden onChange={onFile} />
-        <button id="importar" onClick={() => fileRef.current?.click()} disabled={busy}>↑ Importar respaldo (JSON)</button>
+        <button ref={importButton} id="importar" onClick={() => fileRef.current?.click()} disabled={busy}>↑ Importar respaldo (JSON)</button>
       </div>
       <p className="hint">Acepta el respaldo del prototipo anterior (version 1) o una exportación de esta app. Primero vas a ver una vista previa; nada se guarda hasta que confirmes. Repetir la misma importación no duplica registros.</p>
-      {busy && <div className="loading">Procesando…</div>}
-      {errors.length > 0 && <div className="notice danger" role="alert">{errors.slice(0, 12).map((e, i) => <div key={i}>{e}</div>)}</div>}
-      {preview && (
-        <div className="preview">
-          <strong>Vista previa ({preview.summary.format === 'legacy-v1' ? 'respaldo del prototipo' : 'exportación de esta app'})</strong>
-          <div>{preview.summary.total} registros: {preview.summary.new} nuevos, {preview.summary.duplicates} ya importados, {preview.summary.conflicts} en conflicto.</div>
-          <div>Por moneda: {Object.entries(preview.summary.byCurrency).map(([c, n]) => `${c} ${n}`).join(' · ')}. Las monedas no se suman entre sí.</div>
-          {preview.warnings.map((w) => <div key={w} className="notice warn">{w}</div>)}
-          {preview.conflicts.length > 0 && <div className="notice warn">Con contenido distinto al ya importado (no se sobrescriben): {preview.conflicts.map((c) => c.concept ?? c.sourceId).join(', ')}</div>}
-          {preview.accountsToCreate.length > 0 && (
-            <>
-              <div>Cuentas nuevas a crear (elegí el tipo):</div>
-              {preview.accountsToCreate.map((a) => (
-                <div className="inline" key={a.key}>
-                  <label>{a.name} ({a.currency})
-                    <select value={kinds[a.key] ?? 'bank'} onChange={(e) => setKinds({ ...kinds, [a.key]: e.target.value as AccountKind })}>
-                      {Object.entries(KIND_LABEL).map(([k, l]) => <option key={k} value={k}>{l}</option>)}
-                    </select>
-                  </label>
-                </div>
-              ))}
-            </>
-          )}
-          {preview.categoriesToCreate.length > 0 && <div>Categorías nuevas: {preview.categoriesToCreate.join(', ')}</div>}
-          <div className="tablewrap">
-            <table>
-              <thead><tr><th>Concepto</th><th>Tipo</th><th>Fecha</th><th>Cuenta</th><th className="num">Importe total</th></tr></thead>
-              <tbody>
-                {preview.sample.map((s, i) => (
-                  <tr key={i}>
-                    <td>{s.concept}</td>
-                    <td>{s.type}{s.count && s.count !== '1' ? ` · ${s.count} cuotas` : ''}</td>
-                    <td>{s.date ? formatDate(s.date) : ''}</td>
-                    <td>{s.account ?? 'Sin especificar'}</td>
-                    <td className="num">{s.amountMinor && s.currency ? formatMoney(s.amountMinor, s.currency as Currency) : ''}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-          <div className="actions">
-            <button type="button" onClick={() => setPreview(null)}>Cancelar</button>
-            <button type="button" className="primary" onClick={commit} disabled={busy || preview.summary.new === 0}>Confirmar importación</button>
-          </div>
-        </div>
-      )}
+      {busy && !preview && <div className="loading">Procesando…</div>}
+      {!preview && <ImportErrors errors={errors} />}
+      <ImportConfirmDialog preview={preview} kinds={kinds} onKindsChange={setKinds} busy={busy} errors={errors} onCancel={closePreview} onConfirm={commit} />
     </section>
   );
 }

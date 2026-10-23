@@ -1,6 +1,8 @@
 /*
- * Estilos portados SIN CAMBIOS de reference/style.css (prototipo aprobado).
- * Única diferencia: se eliminó el @import de Google Fonts; Manrope y DM Sans se autoalojan (ver main.tsx).
+ * Estilos portados de reference/style.css (prototipo aprobado). Diferencias, y solo estas:
+ * - se eliminó el @import de Google Fonts; Manrope y DM Sans se autoalojan (ver main.tsx);
+ * - .stat strong y .panel h2 suman el fallback sans-serif que el prototipo omitía (docs/01: «mantener pesos y
+ *   fallback sans-serif»; sin él, mientras carga Manrope se veían en una fuente con serifa).
  * Los agregados para pantallas nuevas están en extensions.css y reutilizan las mismas variables.
  */
 :root{color-scheme:dark;--bg:#101112;--panel:#191b1d;--border:#2a2d30;--muted:#91969d;--text:#f0f2f2;--lime:#d2f88b}
@@ -46,12 +48,12 @@ h1 span{color:var(--lime)}
 .stat,.panel{background:var(--panel);border:1px solid var(--border);border-radius:15px;padding:23px}
 .stat:first-child{background:linear-gradient(120deg,#283124,#1c241b);border-color:#424c37}
 .stat .label{color:#b3b9b6;font-size:12px;display:flex;justify-content:space-between}
-.stat strong{display:block;font:600 clamp(20px,2vw,30px) Manrope;margin:18px 0 10px;letter-spacing:-1px}
+.stat strong{display:block;font:600 clamp(20px,2vw,30px) Manrope,sans-serif;margin:18px 0 10px;letter-spacing:-1px}
 .stat small{font-size:10px;color:var(--muted)}
 .green{color:var(--lime)}
 .red{color:#efb0a6}
 .grid{display:grid;grid-template-columns:1.6fr 1fr;gap:20px;margin-top:22px}
-.panel h2{font:600 17px Manrope;margin:0 0 5px}
+.panel h2{font:600 17px Manrope,sans-serif;margin:0 0 5px}
 .panel p{color:var(--muted);font-size:12px;margin:0}
 .panelhead{display:flex;justify-content:space-between;align-items:center;margin-bottom:24px}
 .chip{font-size:10px;color:var(--lime);background:#2a3322;padding:6px 9px;border-radius:6px}

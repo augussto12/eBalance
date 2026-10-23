@@ -3,6 +3,8 @@ import { useQueryClient } from '@tanstack/react-query';
 import QRCode from 'qrcode';
 import { ApiError, api, resetCsrf } from '../api/client';
 import type { Me } from '../api/types';
+import { PasswordField } from '../components/PasswordField';
+import { passwordTooLong } from '../lib/forms';
 import { RecoveryCodes } from '../pages/SettingsPage';
 
 function AuthCard({ eyebrow, title, lead, children }: { eyebrow: string; title: string; lead: ReactNode; children: ReactNode }) {
@@ -42,6 +44,8 @@ export function LoginPage() {
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (busy) return;
+    // Demasiado larga: el aviso ya está junto al campo; no se recorta ni se envía.
+    if (passwordTooLong(password)) return;
     setBusy(true);
     setError(null);
     try {
@@ -63,10 +67,7 @@ export function LoginPage() {
           Usuario
           <input autoComplete="username" value={username} onChange={(e) => setUsername(e.target.value)} required maxLength={64} />
         </label>
-        <label>
-          Contraseña
-          <input type="password" autoComplete="current-password" value={password} onChange={(e) => setPassword(e.target.value)} required maxLength={128} />
-        </label>
+        <PasswordField label="Contraseña" autoComplete="current-password" value={password} onChange={setPassword} />
         {error && <p className="formerror" role="alert">{error}</p>}
         <button className="primary" disabled={busy}>{busy ? 'Ingresando…' : 'Ingresar'}</button>
       </form>
