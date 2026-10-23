@@ -72,19 +72,23 @@ public sealed class ReportService(AppDbContext db)
     }
 }
 
-public sealed record AccountBalance(long? CashBalanceMinor, long? PendingObligationsMinor);
+/// <summary>Saldo de caja calculado al día <paramref name="AsOf"/> (hoy del propietario) o pendiente total de una tarjeta.</summary>
+public sealed record AccountBalance(long? CashBalanceMinor, long? PendingObligationsMinor, DateOnly? AsOf = null);
 
 /// <summary>
-/// Saldo de caja = apertura + flujos registrados desde la fecha de apertura. Sin apertura, no se informa saldo:
-/// no se muestra un «disponible» supuesto con datos incompletos.
+/// Saldo de caja = apertura + flujos registrados desde la fecha de apertura y HASTA HOY en el calendario del
+/// propietario: un gasto, pago, transferencia o acreditación con fecha futura todavía no movió caja. Sin apertura no
+/// se informa saldo: no se muestra un «disponible» supuesto con datos incompletos.
 /// </summary>
-public sealed class BalanceService(AppDbContext db)
+public sealed class BalanceService(AppDbContext db, TimeProvider clock)
 {
     public async Task<Dictionary<Guid, AccountBalance>> ComputeAsync(Guid owner, IReadOnlyList<Account> accounts, CancellationToken ct)
     {
         var result = new Dictionary<Guid, AccountBalance>();
         var ids = accounts.Select(a => a.Id).ToList();
         if (ids.Count == 0) return result;
+        var zoneId = await db.Users.AsNoTracking().Where(u => u.Id == owner).Select(u => u.TimeZoneId).SingleOrDefaultAsync(ct);
+        var today = FinanceCalendar.Today(clock, FinanceCalendar.ZoneOrDefault(zoneId));
 
         var entries = await db.Entries.AsNoTracking()
             .Where(e => e.OwnerId == owner && e.DeletedAt == null && e.AccountId != null && ids.Contains(e.AccountId.Value))
@@ -122,18 +126,18 @@ public sealed class BalanceService(AppDbContext db)
                 continue;
             }
             var balance = opening;
-            foreach (var e in entries.Where(x => x.AccountId == a.Id && x.EffectiveDate >= from))
+            foreach (var e in entries.Where(x => x.AccountId == a.Id && x.EffectiveDate >= from && x.EffectiveDate <= today))
                 balance = e.Kind == EntryKind.Income ? checked(balance + e.AmountMinor) : checked(balance - e.AmountMinor);
-            foreach (var p in payments.Where(x => x.SourceAccountId == a.Id && x.Date >= from))
+            foreach (var p in payments.Where(x => x.SourceAccountId == a.Id && x.Date >= from && x.Date <= today))
                 balance = checked(balance - p.AmountMinor);
-            foreach (var t in transfers.Where(x => x.Date >= from))
+            foreach (var t in transfers.Where(x => x.Date >= from && x.Date <= today))
             {
                 if (t.FromAccountId == a.Id) balance = checked(balance - t.AmountMinor);
                 if (t.ToAccountId == a.Id) balance = checked(balance + t.AmountMinor);
             }
-            foreach (var d in disbursements.Where(x => x.AccountId == a.Id && x.Date >= from))
+            foreach (var d in disbursements.Where(x => x.AccountId == a.Id && x.Date >= from && x.Date <= today))
                 balance = checked(balance + d.Amount);
-            result[a.Id] = new AccountBalance(balance, null);
+            result[a.Id] = new AccountBalance(balance, null, today);
         }
         return result;
     }

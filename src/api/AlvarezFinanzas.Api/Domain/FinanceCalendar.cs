@@ -40,6 +40,10 @@ public static class FinanceCalendar
 
     public static string FormatMonth(DateOnly d) => $"{d.Year:D4}-{d.Month:D2}";
 
+    /// <summary>Zona horaria del propietario; si el identificador no existe en el sistema, Argentina.</summary>
+    public static TimeZoneInfo ZoneOrDefault(string? timeZoneId) =>
+        !string.IsNullOrEmpty(timeZoneId) && TimeZoneInfo.TryFindSystemTimeZoneById(timeZoneId, out var zone) ? zone : ArgentinaZone;
+
     public static DateOnly Today(TimeProvider clock, TimeZoneInfo zone) =>
         DateOnly.FromDateTime(TimeZoneInfo.ConvertTime(clock.GetUtcNow(), zone).DateTime);
 

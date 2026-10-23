@@ -1,3 +1,4 @@
+using AlvarezFinanzas.Application;
 using AlvarezFinanzas.Domain;
 using AlvarezFinanzas.Infrastructure;
 using AlvarezFinanzas.Infrastructure.Auth;
@@ -132,7 +133,7 @@ public static class EntryEndpoints
         if (entry.Version != req.Version) return Problems.VersionConflict(Dto(entry));
         if (entry.PaidMinor > 0 && (val.Amount < entry.PaidMinor || val.Currency != entry.Currency || val.Account?.Id != entry.AccountId || val.Kind != entry.Kind))
         {
-            return Problems.Conflict("Este gasto tiene pagos aplicados. Revertí los pagos antes de cambiar importe, moneda, tipo o tarjeta.");
+            return Problems.PaymentsApplied("Este gasto tiene pagos aplicados. Revertí los pagos antes de cambiar importe, moneda, tipo o tarjeta.");
         }
         entry.Kind = val.Kind;
         entry.Concept = val.Concept;
@@ -154,17 +155,19 @@ public static class EntryEndpoints
         var entry = await db.Entries.SingleOrDefaultAsync(e => e.Id == id && e.OwnerId == owner && e.DeletedAt == null, ct);
         if (entry is null) return Problems.NotFound();
         if (version is null || entry.Version != version) return Problems.VersionConflict(Dto(entry));
-        if (entry.PaidMinor > 0) return Problems.Conflict("Este gasto tiene pagos aplicados. Revertí los pagos antes de eliminarlo.");
+        if (entry.PaidMinor > 0) return Problems.PaymentsApplied("Este gasto tiene pagos aplicados. Revertí los pagos antes de eliminarlo.");
         entry.DeletedAt = clock.GetUtcNow();
         audit.Add(db, "entry.delete", "success", "entry", id);
         return await Db.SaveVersionedAsync(db, ct) == SaveOutcome.Ok ? TypedResults.Ok(Dto(entry)) : Problems.VersionConflict();
     }
 
-    private static async Task<IResult> Restore(Guid id, HttpContext ctx, AppDbContext db, AuditLog audit, CancellationToken ct)
+    /// <summary>Restaura desde la papelera. Igual que el borrado, exige la versión actual (?version=).</summary>
+    private static async Task<IResult> Restore(Guid id, long? version, HttpContext ctx, AppDbContext db, AuditLog audit, CancellationToken ct)
     {
         var owner = ctx.User.UserId();
         var entry = await db.Entries.SingleOrDefaultAsync(e => e.Id == id && e.OwnerId == owner && e.DeletedAt != null, ct);
         if (entry is null) return Problems.NotFound();
+        if (version is null || entry.Version != version) return Problems.VersionConflict(Dto(entry));
         entry.DeletedAt = null;
         audit.Add(db, "entry.restore", "success", "entry", id);
         return await Db.SaveVersionedAsync(db, ct) == SaveOutcome.Ok ? TypedResults.Ok(Dto(entry)) : Problems.VersionConflict();

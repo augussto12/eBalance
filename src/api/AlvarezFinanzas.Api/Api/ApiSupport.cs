@@ -76,39 +76,6 @@ public sealed class Validation
     }
 }
 
-public static class ApiMaps
-{
-    public static readonly IReadOnlyDictionary<string, EntryKind> EntryKinds = new Dictionary<string, EntryKind>
-    {
-        ["income"] = EntryKind.Income, ["expense"] = EntryKind.Expense,
-    };
-    public static readonly IReadOnlyDictionary<string, PlanKind> PlanKinds = new Dictionary<string, PlanKind>
-    {
-        ["card"] = PlanKind.Card, ["loan"] = PlanKind.Loan,
-    };
-    public static readonly IReadOnlyDictionary<string, AccountKind> AccountKinds = new Dictionary<string, AccountKind>
-    {
-        ["cash"] = AccountKind.Cash, ["bank"] = AccountKind.Bank, ["wallet"] = AccountKind.Wallet, ["credit_card"] = AccountKind.CreditCard,
-    };
-    public static readonly IReadOnlyDictionary<string, CategoryKind> CategoryKinds = new Dictionary<string, CategoryKind>
-    {
-        ["expense"] = CategoryKind.Expense, ["income"] = CategoryKind.Income, ["any"] = CategoryKind.Any,
-    };
-
-    public static string Api(this EntryKind k) => k == EntryKind.Income ? "income" : "expense";
-    public static string Api(this PlanKind k) => k == PlanKind.Card ? "card" : "loan";
-    public static string Api(this AccountKind k) => k switch
-    {
-        AccountKind.Cash => "cash", AccountKind.Bank => "bank", AccountKind.Wallet => "wallet", _ => "credit_card",
-    };
-    public static string Api(this CategoryKind k) => k switch
-    {
-        CategoryKind.Expense => "expense", CategoryKind.Income => "income", _ => "any",
-    };
-    public static string Api(this DateOnly d) => d.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
-    public static string? Api(this DateOnly? d) => d?.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
-}
-
 public static class Problems
 {
     public static ProblemHttpResult NotFound() =>
@@ -117,6 +84,14 @@ public static class Problems
     public static ProblemHttpResult Conflict(string title, object? current = null) =>
         TypedResults.Problem(title: title, statusCode: StatusCodes.Status409Conflict,
             extensions: current is null ? null : new Dictionary<string, object?> { ["current"] = current });
+
+    /// <summary>
+    /// 409 porque el registro tiene pagos vigentes aplicados. El código «payments_applied» le permite a la UI ofrecer
+    /// la lista de pagos para revertirlos, en vez de un mensaje sin salida.
+    /// </summary>
+    public static ProblemHttpResult PaymentsApplied(string title) =>
+        TypedResults.Problem(title: title, statusCode: StatusCodes.Status409Conflict,
+            extensions: new Dictionary<string, object?> { ["code"] = "payments_applied" });
 
     public static ProblemHttpResult VersionConflict(object? current = null) =>
         Conflict("El registro cambió desde que lo abriste. Revisá los datos actuales antes de guardar.", current);
