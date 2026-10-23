@@ -116,10 +116,9 @@ public class ImportConsistencyTests(PostgresFixture pg)
         Assert.Equal(HttpStatusCode.OK, preview.StatusCode);
         var batchId = Guid.Parse((await preview.Json()).Str("batchId"));
 
-        using (var scope = app.Services.CreateScope())
+        await using (var db = app.NewDbContext())
         {
-            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-            var batch = await db.ImportBatches.SingleAsync(b => b.Id == batchId);
+            var batch = await db.ImportBatches.IgnoreQueryFilters([AppDbContext.OwnerFilter]).SingleAsync(b => b.Id == batchId);
             var records = JsonNode.Parse(batch.NormalizedPayload!)!.AsArray();
             var record = records.Single(r => r!["target"]!.GetValue<string>() == target && r["sourceId"]!.GetValue<string>() == sourceId)!;
             record["fields"]![field] = value;

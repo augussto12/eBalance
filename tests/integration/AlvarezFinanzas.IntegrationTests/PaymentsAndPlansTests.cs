@@ -125,12 +125,12 @@ public class PaymentsAndPlansTests(PostgresFixture pg)
         Assert.NotEqual(JsonValueKind.Null, reversed.GetProperty("reversedAt").ValueKind);
         var allocation = Assert.Single(reversed.GetProperty("allocations").EnumerateArray());
         Assert.Equal(1, allocation.GetProperty("installmentNumber").GetInt32());
-        using var scope = app.Services.CreateScope();
-        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        // Fuera de un request no hay propietario: la verificación directa en la base usa el bypass explícito del filtro.
+        await using var db = app.NewDbContext();
         var paymentId = payment.Str("id");
-        Assert.Equal(1, await db.AuditEvents.CountAsync(e => e.Action == "payment.create" && e.ResourceId == paymentId));
-        Assert.Equal(1, await db.AuditEvents.CountAsync(e => e.Action == "payment.reverse" && e.ResourceId == paymentId));
-        Assert.True(await db.Payments.AnyAsync(p => p.Id == Guid.Parse(paymentId) && p.DeletedAt != null));
+        Assert.Equal(1, await db.AuditEvents.IgnoreQueryFilters([AppDbContext.OwnerFilter]).CountAsync(e => e.Action == "payment.create" && e.ResourceId == paymentId));
+        Assert.Equal(1, await db.AuditEvents.IgnoreQueryFilters([AppDbContext.OwnerFilter]).CountAsync(e => e.Action == "payment.reverse" && e.ResourceId == paymentId));
+        Assert.True(await db.Payments.IgnoreQueryFilters([AppDbContext.OwnerFilter]).AnyAsync(p => p.Id == Guid.Parse(paymentId) && p.DeletedAt != null));
     }
 
     [Fact]
@@ -443,13 +443,12 @@ public class PaymentsAndPlansTests(PostgresFixture pg)
         var loan = Guid.Parse((await a.PostJson("/api/v1/plans", PlanBody(null, "3000", 3, "2026-10-10", kind: "loan"))).Str("id"));
         Assert.Equal("-1000", (await a.GetJson($"/api/v1/accounts/{bank}")).Str("cashBalanceMinor"));
 
-        using (var scope = app.Services.CreateScope())
+        await using (var db = app.NewDbContext())
         {
-            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-            (await db.Entries.SingleAsync(e => e.Id == entry)).Currency = Currency.USD;
-            (await db.Plans.SingleAsync(p => p.Id == plan)).Currency = Currency.USD;
+            (await db.Entries.IgnoreQueryFilters([AppDbContext.OwnerFilter]).SingleAsync(e => e.Id == entry)).Currency = Currency.USD;
+            (await db.Plans.IgnoreQueryFilters([AppDbContext.OwnerFilter]).SingleAsync(p => p.Id == plan)).Currency = Currency.USD;
             // Cuenta de acreditación sin capital: la base lo admite; antes rompía el cálculo de saldos.
-            (await db.Plans.SingleAsync(p => p.Id == loan)).DisbursementAccountId = bank;
+            (await db.Plans.IgnoreQueryFilters([AppDbContext.OwnerFilter]).SingleAsync(p => p.Id == loan)).DisbursementAccountId = bank;
             await db.SaveChangesAsync();
         }
         var accounts = (await a.GetJson("/api/v1/accounts")).EnumerateArray().ToDictionary(x => x.Str("name"));
