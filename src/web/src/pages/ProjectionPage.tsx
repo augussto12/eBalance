@@ -1,7 +1,7 @@
 import { useQuery } from '@tanstack/react-query';
 import { api } from '../api/client';
 import type { MonthTotals } from '../api/types';
-import { QueryState } from '../components/Records';
+import { QueryState, RefetchError } from '../components/Records';
 import { useUi } from '../components/Ui';
 import { monthLong } from '../lib/dates';
 import { formatMoney } from '../lib/money';
@@ -19,6 +19,7 @@ export function ProjectionPage() {
       </div>
       <section className="panel">
         <h2>Los próximos 12 meses</h2>
+        {q.data && <RefetchError error={q.error} retrying={q.isFetching} onRetry={() => q.refetch()} />}
         {q.data ? (
           <div className="tablewrap">
             <table>

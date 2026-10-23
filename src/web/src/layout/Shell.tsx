@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react';
 import { Outlet, useLocation, useNavigate } from 'react-router';
 import { useIsMutating, useQueryClient } from '@tanstack/react-query';
-import type { Me } from '../api/types';
-import { api, resetCsrf } from '../api/client';
+import type { Entry, Me, Page, Plan } from '../api/types';
+import { ApiError, api, resetCsrf } from '../api/client';
 import { useUi } from '../components/Ui';
 import { addMonths, isValidMonth } from '../lib/dates';
 import type { Currency } from '../lib/money';
@@ -19,8 +19,33 @@ export const PAGES: PageDef[] = [
 ];
 const SETTINGS: PageDef = { path: '/configuracion', name: 'Configuración', icon: '⚙', subtitle: 'Cuentas, categorías, seguridad y respaldos.' };
 
+/** ¿Ya hay registros propios (movimientos o planes, de cualquier mes y moneda)? */
+async function hasRecords(): Promise<boolean> {
+  const [entries, plans] = await Promise.all([api<Page<Entry>>('GET', '/entries?pageSize=1'), api<Plan[]>('GET', '/plans')]);
+  return entries.total > 0 || plans.length > 0;
+}
+
+/**
+ * Datos de ejemplo (solo desarrollo, opt-in): nunca se mezclan en silencio con los reales (docs/01).
+ * Si ya hay registros, o no se puede saber, se pide confirmación con el modal de la app.
+ */
+export async function confirmDemoLoad(existing: () => Promise<boolean>, confirm: ReturnType<typeof useUi>['confirm']): Promise<boolean> {
+  let hasData = true;
+  try {
+    hasData = await existing();
+  } catch {
+    // Ante la duda se pregunta.
+  }
+  if (!hasData) return true;
+  return confirm({
+    title: 'Agregar datos de ejemplo',
+    message: 'Ya tenés registros. Esto agregará movimientos ficticios (marcados «· ejemplo») junto a los tuyos. ¿Continuar?',
+    confirmLabel: 'Agregar ejemplos',
+  });
+}
+
 export function Shell({ me }: { me: Me }) {
-  const { month, setMonth, currency, setCurrency, openRecord, toast } = useUi();
+  const { month, setMonth, currency, setCurrency, openRecord, toast, confirm } = useUi();
   const location = useLocation();
   const navigate = useNavigate();
   const qc = useQueryClient();
@@ -41,9 +66,14 @@ export function Shell({ me }: { me: Me }) {
   };
 
   const loadDemo = async () => {
-    await api('POST', '/dev/demo', { month, currency });
-    await invalidateFinancial(qc);
-    toast('Ejemplos agregados: podés eliminarlos en Movimientos.');
+    if (!(await confirmDemoLoad(hasRecords, confirm))) return;
+    try {
+      await api('POST', '/dev/demo', { month, currency });
+      await invalidateFinancial(qc);
+      toast('Ejemplos agregados: podés eliminarlos en Movimientos.');
+    } catch (e) {
+      toast(e instanceof ApiError ? e.title : 'No se pudieron agregar los ejemplos.', { error: true });
+    }
   };
 
   return (

@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useId, useMemo, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { ApiError, api } from '../api/client';
 import type { Account, AccountKind, Category, Entry, Plan } from '../api/types';
 import { distribute, formatMoney, minorToInput, parseAmountInput, type Currency } from '../lib/money';
 import { formatDate, todayIso } from '../lib/dates';
-import { FieldError, Modal } from './Modal';
+import { mapFieldErrors, type FieldErrors } from '../lib/forms';
+import { Modal, useFieldErrors } from './Modal';
 import { useUi } from './Ui';
 import { invalidateFinancial, useAccounts, useCategories } from '../pages/queries';
 
@@ -17,7 +18,7 @@ export type RecordTarget =
 const NEW_ACCOUNT = '__new__';
 const isPlan = (t: RecordType) => t === 'card' || t === 'loan';
 
-interface FormState {
+export interface FormState {
   type: RecordType;
   concept: string;
   amount: string;
@@ -38,7 +39,7 @@ interface FormState {
   version: number | null;
 }
 
-const empty = (type: RecordType, currency: Currency): FormState => ({
+export const empty = (type: RecordType, currency: Currency): FormState => ({
   type,
   concept: '',
   amount: '',
@@ -87,12 +88,32 @@ const fromPlan = (p: Plan): FormState => ({
   version: p.version,
 });
 
-const FIELD_MAP: Record<string, keyof FormState> = {
+/** Claves de validación del servidor (POST/PATCH /entries y /plans) → campo del formulario. */
+export const RECORD_FIELD_MAP: Readonly<Partial<Record<string, keyof FormState>>> = {
   kind: 'type', concept: 'concept', amountMinor: 'amount', currency: 'currency', date: 'date', firstDueDate: 'date',
   accountId: 'accountId', categoryId: 'categoryId', count: 'count', amountMode: 'amountMode', paidBeforeCount: 'paidBefore',
   remainingOnly: 'ongoing', disbursementMinor: 'disbursement', disbursementDate: 'disbursementDate', disbursementAccountId: 'disbursementAccountId',
-  note: 'note', name: 'newAccountName',
+  note: 'note',
 };
+
+/** Alta de la cuenta nueva desde el formulario (POST /accounts): sus claves son de la cuenta, no del registro. */
+export const NEW_ACCOUNT_FIELD_MAP: Readonly<Partial<Record<string, keyof FormState>>> = {
+  name: 'newAccountName', kind: 'newAccountKind', currency: 'currency',
+};
+
+/** Campos que el formulario muestra en este estado: un error de un campo oculto se muestra como error general, nunca se pierde. */
+export function visibleFields(f: FormState): Set<keyof FormState> {
+  const v = new Set<keyof FormState>(['type', 'concept', 'amount', 'currency', 'date', 'categoryId', 'accountId', 'note']);
+  if (f.accountId === NEW_ACCOUNT) v.add('newAccountName').add('newAccountKind');
+  if (isPlan(f.type)) {
+    v.add('amountMode').add('count').add('ongoing');
+    if (f.ongoing === 'paid') v.add('paidBefore');
+    if (f.type === 'loan') v.add('disbursement').add('disbursementDate').add('disbursementAccountId');
+  }
+  return v;
+}
+
+const ONGOING_FIELDS: (keyof FormState)[] = ['ongoing', 'paidBefore', 'disbursement', 'disbursementDate', 'disbursementAccountId'];
 
 export function RecordDialog({ target, onClose }: { target: RecordTarget | null; onClose: () => void }) {
   const { currency } = useUi();
@@ -132,17 +153,19 @@ export function RecordDialog({ target, onClose }: { target: RecordTarget | null;
   );
 }
 
-function RecordFormBody({ initial, editId, plan, onClose, reload }: {
+export function RecordFormBody({ initial, editId, plan, onClose, reload, initialErrors = {} }: {
   initial: FormState;
   editId?: string;
   plan?: Plan;
   onClose: () => void;
   reload?: () => void;
+  /** Errores de campo con los que arranca el formulario (se usa en las pruebas de accesibilidad). */
+  initialErrors?: FieldErrors<keyof FormState>;
 }) {
   const qc = useQueryClient();
   const { toast } = useUi();
   const [f, setF] = useState<FormState>(initial);
-  const [errors, setErrors] = useState<Partial<Record<keyof FormState, string[]>>>({});
+  const [errors, setErrors] = useState<FieldErrors<keyof FormState>>(initialErrors);
   const [formError, setFormError] = useState<string | null>(null);
   const [conflict, setConflict] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -169,7 +192,7 @@ function RecordFormBody({ initial, editId, plan, onClose, reload }: {
   }, [plan_, f.amount, f.amountMode, f.count]);
 
   const validate = (): boolean => {
-    const e: Partial<Record<keyof FormState, string[]>> = {};
+    const e: FieldErrors<keyof FormState> = {};
     if (!f.concept.trim()) e.concept = ['El concepto es obligatorio.'];
     const amount = parseAmountInput(f.amount);
     if (!amount.ok) e.amount = [amount.error];
@@ -183,9 +206,10 @@ function RecordFormBody({ initial, editId, plan, onClose, reload }: {
         const pb = Number(f.paidBefore);
         if (!Number.isInteger(pb) || pb < 1 || pb >= count) e.paidBefore = ['Debe ser menor que la cantidad de cuotas.'];
       }
-      if (f.disbursement) {
+      if (f.type === 'loan' && f.disbursement) {
         const d = parseAmountInput(f.disbursement);
         if (!d.ok) e.disbursement = [d.error];
+        if (!f.disbursementDate) e.disbursementDate = ['Indicá la fecha de acreditación.'];
       }
     }
     setErrors(e);
@@ -199,10 +223,13 @@ function RecordFormBody({ initial, editId, plan, onClose, reload }: {
     setConflict(false);
     if (!validate()) return;
     setSaving(true);
+    let fieldMap = RECORD_FIELD_MAP;
     try {
       let accountId: string | null = f.accountId || null;
       if (accountId === NEW_ACCOUNT) {
+        fieldMap = NEW_ACCOUNT_FIELD_MAP;
         const created = await api<Account>('POST', '/accounts', { name: f.newAccountName.trim(), kind: f.newAccountKind, currency: f.currency });
+        fieldMap = RECORD_FIELD_MAP;
         accountId = created.id;
         await qc.invalidateQueries({ queryKey: ['accounts'] });
         setF((s) => ({ ...s, accountId: created.id }));
@@ -248,13 +275,10 @@ function RecordFormBody({ initial, editId, plan, onClose, reload }: {
           // El formulario abierto NO se recarga solo: la persona decide si carga la versión actual.
           void qc.invalidateQueries({ predicate: (q) => !['me', 'entry', 'plan'].includes(String(q.queryKey[0])) });
         }
-        const mapped: Partial<Record<keyof FormState, string[]>> = {};
-        for (const [k, v] of Object.entries(err.fieldErrors)) {
-          const key = FIELD_MAP[k] ?? 'concept';
-          mapped[key] = [...(mapped[key] ?? []), ...v];
-        }
-        setErrors(mapped);
-        setFormError(err.title);
+        // Cada mensaje va junto a su campo; las claves sin campo (p. ej. version) se suman al mensaje general.
+        const { fields, other } = mapFieldErrors(err.fieldErrors, fieldMap);
+        setErrors(fields);
+        setFormError([err.title, ...other].join(' '));
       } else {
         setFormError('No se pudo guardar. Probá de nuevo.');
       }
@@ -263,10 +287,11 @@ function RecordFormBody({ initial, editId, plan, onClose, reload }: {
     }
   };
 
-  const fieldProps = (k: keyof FormState) => ({
-    'aria-invalid': errors[k]?.length ? true : undefined,
-    'aria-describedby': errors[k]?.length ? `err-${k}` : undefined,
-  });
+  const fe = useFieldErrors(errors);
+  const fieldProps = fe.props;
+  const visible = visibleFields(f);
+  const hiddenErrors = Object.entries(errors).filter(([k]) => !visible.has(k as keyof FormState)).flatMap(([, v]) => v ?? []);
+  const generalError = [formError, ...hiddenErrors].filter(Boolean).join(' ');
 
   const hint = plan_
     ? 'El total se divide en cuotas mensuales exactas. Para préstamos, incluí los intereses en el total. El desembolso recibido se registra aparte y no cuenta como ingreso del mes.'
@@ -282,43 +307,48 @@ function RecordFormBody({ initial, editId, plan, onClose, reload }: {
       )}
       <label>
         Tipo
-        <select value={f.type} disabled={!!editId} onChange={(e) => setF((s) => ({ ...empty(e.target.value as RecordType, s.currency), concept: s.concept, amount: s.amount, date: s.date, categoryId: s.categoryId }))}>
+        <select value={f.type} disabled={!!editId} onChange={(e) => setF((s) => ({ ...empty(e.target.value as RecordType, s.currency), concept: s.concept, amount: s.amount, date: s.date, categoryId: s.categoryId }))} {...fieldProps('type')}>
           <option value="expense">Gasto</option>
           <option value="income">Ingreso</option>
           <option value="card">Compra en cuotas</option>
           <option value="loan">Plan de cuotas de préstamo</option>
         </select>
+        {fe.error('type')}
       </label>
       <label>
         Concepto
         <input value={f.concept} onChange={(e) => set('concept', e.target.value)} required maxLength={90} placeholder="Ej. Supermercado, sueldo, monitor…" {...fieldProps('concept')} />
-        <FieldError id="err-concept" errors={errors.concept} />
+        {fe.error('concept')}
       </label>
       {plan_ && (
-        <div className="choice" role="radiogroup" aria-label="El importe ingresado es">
-          <label><input type="radio" name="amountMode" checked={f.amountMode === 'total'} disabled={scheduleLocked} onChange={() => set('amountMode', 'total')} />Total de todas las cuotas</label>
-          <label><input type="radio" name="amountMode" checked={f.amountMode === 'installment'} disabled={scheduleLocked} onChange={() => set('amountMode', 'installment')} />Cuota mensual</label>
-        </div>
+        <>
+          <div className="choice" role="radiogroup" aria-label="El importe ingresado es" {...fieldProps('amountMode')}>
+            <label><input type="radio" name="amountMode" checked={f.amountMode === 'total'} disabled={scheduleLocked} onChange={() => set('amountMode', 'total')} />Total de todas las cuotas</label>
+            <label><input type="radio" name="amountMode" checked={f.amountMode === 'installment'} disabled={scheduleLocked} onChange={() => set('amountMode', 'installment')} />Cuota mensual</label>
+          </div>
+          {fe.error('amountMode')}
+        </>
       )}
       <div className="fields">
         <label>
           <span>{plan_ ? (f.amountMode === 'total' ? 'Total de todas las cuotas' : 'Importe de cada cuota') : 'Importe'}</span>
           <input inputMode="decimal" autoComplete="off" value={f.amount} disabled={scheduleLocked} onChange={(e) => set('amount', e.target.value)} required placeholder="0,00" {...fieldProps('amount')} />
-          <FieldError id="err-amount" errors={errors.amount} />
+          {fe.error('amount')}
         </label>
         <label>
           Moneda
-          <select value={f.currency} disabled={scheduleLocked} onChange={(e) => setF((s) => ({ ...s, currency: e.target.value as Currency, accountId: '', disbursementAccountId: '' }))}>
+          <select value={f.currency} disabled={scheduleLocked} onChange={(e) => setF((s) => ({ ...s, currency: e.target.value as Currency, accountId: '', disbursementAccountId: '' }))} {...fieldProps('currency')}>
             <option>ARS</option>
             <option>USD</option>
           </select>
+          {fe.error('currency')}
         </label>
       </div>
       <div className="fields">
         <label>
           <span>{plan_ ? 'Fecha de primera cuota' : 'Fecha'}</span>
           <input type="date" value={f.date} disabled={scheduleLocked} onChange={(e) => set('date', e.target.value)} required {...fieldProps('date')} />
-          <FieldError id="err-date" errors={errors.date} />
+          {fe.error('date')}
         </label>
         <label>
           Categoría
@@ -326,7 +356,7 @@ function RecordFormBody({ initial, editId, plan, onClose, reload }: {
             <option value="">Sin categoría</option>
             {(categories.data ?? []).map((c: Category) => <option key={c.id} value={c.id}>{c.name}</option>)}
           </select>
-          <FieldError id="err-categoryId" errors={errors.categoryId} />
+          {fe.error('categoryId')}
         </label>
       </div>
       <label>
@@ -336,23 +366,24 @@ function RecordFormBody({ initial, editId, plan, onClose, reload }: {
           {accountOptions.map((a) => <option key={a.id} value={a.id}>{a.name}{a.kind === 'credit_card' ? ' (tarjeta)' : ''}</option>)}
           <option value={NEW_ACCOUNT}>＋ Nueva cuenta…</option>
         </select>
-        <FieldError id="err-accountId" errors={errors.accountId} />
+        {fe.error('accountId')}
       </label>
       {f.accountId === NEW_ACCOUNT && (
         <div className="fields">
           <label>
             Nombre de la cuenta
             <input value={f.newAccountName} maxLength={60} onChange={(e) => set('newAccountName', e.target.value)} placeholder="Ej. Efectivo, Mercado Pago, Visa" {...fieldProps('newAccountName')} />
-            <FieldError id="err-newAccountName" errors={errors.newAccountName} />
+            {fe.error('newAccountName')}
           </label>
           <label>
             Tipo de cuenta
-            <select value={f.newAccountKind} onChange={(e) => set('newAccountKind', e.target.value as AccountKind)}>
+            <select value={f.newAccountKind} onChange={(e) => set('newAccountKind', e.target.value as AccountKind)} {...fieldProps('newAccountKind')}>
               <option value="cash">Efectivo</option>
               <option value="bank">Banco</option>
               <option value="wallet">Billetera virtual</option>
               {f.type !== 'income' && <option value="credit_card">Tarjeta de crédito</option>}
             </select>
+            {fe.error('newAccountKind')}
           </label>
         </div>
       )}
@@ -360,7 +391,7 @@ function RecordFormBody({ initial, editId, plan, onClose, reload }: {
         <label>
           Cantidad de cuotas
           <input type="number" min={1} max={360} value={f.count} disabled={scheduleLocked} onChange={(e) => set('count', e.target.value)} {...fieldProps('count')} />
-          <FieldError id="err-count" errors={errors.count} />
+          {fe.error('count')}
         </label>
       )}
       {plan_ && preview && !('error' in preview) && preview.parts && (
@@ -374,18 +405,19 @@ function RecordFormBody({ initial, editId, plan, onClose, reload }: {
       )}
       {scheduleLocked && plan && <AdjustPending plan={plan} onDone={onClose} />}
       {plan_ && (
-        <details className="more" open={f.ongoing !== 'none' || !!f.disbursement}>
+        <details className="more" open={f.ongoing !== 'none' || !!f.disbursement || ONGOING_FIELDS.some((k) => errors[k]?.length)}>
           <summary>{f.type === 'loan' ? 'Crédito ya en curso o capital recibido' : 'Compra ya en curso'}</summary>
-          <label className="check"><input type="radio" name="ongoing" checked={f.ongoing === 'none'} disabled={scheduleLocked} onChange={() => set('ongoing', 'none')} />Empieza ahora (sin cuotas pagadas)</label>
-          <label className="check"><input type="radio" name="ongoing" checked={f.ongoing === 'paid'} disabled={scheduleLocked} onChange={() => set('ongoing', 'paid')} />Fecha original y cuotas que ya pagué</label>
+          <label className="check"><input type="radio" name="ongoing" checked={f.ongoing === 'none'} disabled={scheduleLocked} onChange={() => set('ongoing', 'none')} {...fieldProps('ongoing')} />Empieza ahora (sin cuotas pagadas)</label>
+          <label className="check"><input type="radio" name="ongoing" checked={f.ongoing === 'paid'} disabled={scheduleLocked} onChange={() => set('ongoing', 'paid')} {...fieldProps('ongoing')} />Fecha original y cuotas que ya pagué</label>
           {f.ongoing === 'paid' && (
             <label>
               Cuotas ya pagadas antes de registrarlo
               <input type="number" min={1} value={f.paidBefore} disabled={scheduleLocked} onChange={(e) => set('paidBefore', e.target.value)} {...fieldProps('paidBefore')} />
-              <FieldError id="err-paidBefore" errors={errors.paidBefore} />
+              {fe.error('paidBefore')}
             </label>
           )}
-          <label className="check"><input type="radio" name="ongoing" checked={f.ongoing === 'remaining'} disabled={scheduleLocked} onChange={() => set('ongoing', 'remaining')} />Registro solo las cuotas restantes</label>
+          <label className="check"><input type="radio" name="ongoing" checked={f.ongoing === 'remaining'} disabled={scheduleLocked} onChange={() => set('ongoing', 'remaining')} {...fieldProps('ongoing')} />Registro solo las cuotas restantes</label>
+          {fe.error('ongoing')}
           {f.ongoing !== 'none' && <p className="hint">Las cuotas declaradas pagadas no generan pagos ni historial inventado: quedan marcadas como «pagadas antes de registrar».</p>}
           {f.type === 'loan' && (
             <>
@@ -393,11 +425,12 @@ function RecordFormBody({ initial, editId, plan, onClose, reload }: {
                 <label>
                   Capital recibido (opcional)
                   <input inputMode="decimal" value={f.disbursement} onChange={(e) => set('disbursement', e.target.value)} placeholder="0,00" {...fieldProps('disbursement')} />
-                  <FieldError id="err-disbursement" errors={errors.disbursement} />
+                  {fe.error('disbursement')}
                 </label>
                 <label>
                   Fecha de acreditación
-                  <input type="date" value={f.disbursementDate} onChange={(e) => set('disbursementDate', e.target.value)} />
+                  <input type="date" value={f.disbursementDate} onChange={(e) => set('disbursementDate', e.target.value)} {...fieldProps('disbursementDate')} />
+                  {fe.error('disbursementDate')}
                 </label>
               </div>
               <label>
@@ -406,22 +439,23 @@ function RecordFormBody({ initial, editId, plan, onClose, reload }: {
                   <option value="">Sin especificar</option>
                   {cashAccounts.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
                 </select>
-                <FieldError id="err-disbursementAccountId" errors={errors.disbursementAccountId} />
+                {fe.error('disbursementAccountId')}
               </label>
               <p className="hint">El capital es una entrada de caja separada: no se suma a los ingresos del mes ni al balance presupuestario.</p>
             </>
           )}
         </details>
       )}
-      <details className="more" open={!!f.note}>
+      <details className="more" open={!!f.note || !!errors.note?.length}>
         <summary>Nota (opcional)</summary>
         <label>
           Nota
           <input value={f.note} maxLength={500} onChange={(e) => set('note', e.target.value)} {...fieldProps('note')} />
+          {fe.error('note')}
         </label>
       </details>
       <p className="hint">{hint}</p>
-      {formError && !conflict && <p className="formerror" role="alert">{formError}</p>}
+      {generalError && !conflict && <p className="formerror" role="alert">{generalError}</p>}
       <button className="primary full" disabled={saving}>{saving ? 'Guardando…' : 'Guardar registro'}</button>
     </form>
   );
@@ -436,6 +470,7 @@ function AdjustPending({ plan, onDone }: { plan: Plan; onDone: () => void }) {
   const [value, setValue] = useState(minorToInput(currentOpen.toString() || '0'));
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const errorId = `${useId()}err-pending`;
   useEffect(() => setValue(minorToInput(currentOpen.toString())), [currentOpen]);
   if (open.length === 0) return <div className="notice">Todas las cuotas tienen pagos: no hay pendientes para ajustar.</div>;
   const apply = async () => {
@@ -461,11 +496,11 @@ function AdjustPending({ plan, onDone }: { plan: Plan; onDone: () => void }) {
       <div className="inline">
         <label>
           Nuevo total pendiente
-          <input inputMode="decimal" value={value} onChange={(e) => setValue(e.target.value)} />
+          <input inputMode="decimal" value={value} onChange={(e) => setValue(e.target.value)} aria-invalid={error ? true : undefined} aria-describedby={error ? errorId : undefined} />
         </label>
         <button type="button" onClick={apply} disabled={busy}>{busy ? 'Ajustando…' : 'Ajustar pendientes'}</button>
       </div>
-      {error && <p className="formerror" role="alert">{error}</p>}
+      {error && <p className="formerror" id={errorId} role="alert">{error}</p>}
     </div>
   );
 }

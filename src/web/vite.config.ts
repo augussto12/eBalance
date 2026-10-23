@@ -21,6 +21,8 @@ export default defineConfig(({ command }) => ({
   },
   test: {
     environment: 'node',
-    include: ['src/**/*.test.ts'],
+    include: ['src/**/*.test.{ts,tsx}'],
+    // Las pruebas de estilos leen las hojas con ?raw (sin esto Vitest las devuelve vacías).
+    css: { include: [/styles\/.+\.css/] },
   },
 }));

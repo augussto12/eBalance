@@ -128,3 +128,17 @@ export function QueryState({ isPending, error, onRetry }: { isPending: boolean; 
     );
   return null;
 }
+
+/**
+ * Falló una recarga pero hay datos anteriores en pantalla (TanStack Query conserva `data` cuando falla un refetch, y
+ * keepPreviousData muestra la página anterior): no se ocultan en silencio, se avisa que pueden estar desactualizados.
+ */
+export function RefetchError({ error, retrying = false, onRetry }: { error: unknown; retrying?: boolean; onRetry: () => void }) {
+  if (!error) return null;
+  return (
+    <div className="notice danger" role="alert">
+      {error instanceof ApiError ? error.title : 'No se pudieron actualizar los datos.'} Lo que ves puede estar desactualizado.{' '}
+      <button type="button" className="linkbtn" onClick={onRetry} disabled={retrying}>{retrying ? 'Reintentando…' : 'Reintentar'}</button>
+    </div>
+  );
+}

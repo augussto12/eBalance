@@ -2,7 +2,7 @@ import { useQuery } from '@tanstack/react-query';
 import { useNavigate } from 'react-router';
 import { api } from '../api/client';
 import type { Dashboard } from '../api/types';
-import { OccurrenceTable, QueryState } from '../components/Records';
+import { OccurrenceTable, QueryState, RefetchError } from '../components/Records';
 import { useUi } from '../components/Ui';
 import { monthShort } from '../lib/dates';
 import { formatMoney, ratio, type Currency } from '../lib/money';
@@ -21,6 +21,7 @@ export function SummaryPage() {
 
   return (
     <>
+      <RefetchError error={q.error} retrying={q.isFetching} onRetry={() => q.refetch()} />
       <div className="stats">
         <div className="stat">
           <div className="label">Balance del mes <span>↗</span></div>
