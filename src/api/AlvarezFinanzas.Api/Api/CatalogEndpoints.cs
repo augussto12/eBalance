@@ -18,6 +18,7 @@ public static class CatalogEndpoints
     {
         var a = api.MapGroup("/accounts");
         a.MapGet("/", ListAccounts);
+        a.MapGet("/{id:guid}", GetAccount);
         a.MapPost("/", CreateAccount);
         a.MapPatch("/{id:guid}", UpdateAccount);
         a.MapDelete("/{id:guid}", DeleteAccount);
@@ -25,11 +26,14 @@ public static class CatalogEndpoints
 
         var c = api.MapGroup("/categories");
         c.MapGet("/", ListCategories);
+        c.MapGet("/{id:guid}", GetCategory);
         c.MapPost("/", CreateCategory);
         c.MapPatch("/{id:guid}", UpdateCategory);
         c.MapDelete("/{id:guid}", DeleteCategory);
         c.MapPost("/{id:guid}/restore", RestoreCategory);
     }
+
+    private const string CardOpeningMessage = "Las tarjetas no llevan saldo inicial; sus obligaciones se calculan por cuotas y gastos.";
 
     public static object AccountDto(Account a, AccountBalance? balance = null) => new
     {
@@ -43,6 +47,7 @@ public static class CatalogEndpoints
         version = a.Version,
         deletedAt = a.DeletedAt,
         cashBalanceMinor = balance?.CashBalanceMinor?.ToString(CultureInfo.InvariantCulture),
+        cashBalanceAsOf = balance?.AsOf.Api(),
         pendingObligationsMinor = balance?.PendingObligationsMinor?.ToString(CultureInfo.InvariantCulture),
     };
 
@@ -59,6 +64,16 @@ public static class CatalogEndpoints
         var list = await q.OrderBy(a => a.Name).ThenBy(a => a.Currency).ToListAsync(ct);
         var computed = await balances.ComputeAsync(owner, list, ct);
         return TypedResults.Ok(list.Select(a => AccountDto(a, computed.GetValueOrDefault(a.Id))));
+    }
+
+    /// <summary>Una cuenta por ID (también archivada), con su saldo calculado. Ajena o inexistente → 404.</summary>
+    private static async Task<IResult> GetAccount(Guid id, HttpContext ctx, AppDbContext db, BalanceService balances, CancellationToken ct)
+    {
+        var owner = ctx.User.UserId();
+        var account = await db.Accounts.AsNoTracking().SingleOrDefaultAsync(a => a.Id == id && a.OwnerId == owner, ct);
+        if (account is null) return Problems.NotFound();
+        var computed = await balances.ComputeAsync(owner, [account], ct);
+        return TypedResults.Ok(AccountDto(account, computed.GetValueOrDefault(account.Id)));
     }
 
     private static (string? name, AccountKind kind, Currency currency, string? last4, long? opening, DateOnly? openingDate) ValidateAccount(
@@ -88,7 +103,7 @@ public static class CatalogEndpoints
     {
         var v = new Validation();
         var (name, kind, currency, last4, opening, openingDate) = ValidateAccount(req, v, creating: true);
-        if (opening is not null && kind == AccountKind.CreditCard) v.Add("openingBalanceMinor", "Las tarjetas no llevan saldo inicial; sus obligaciones se calculan por cuotas y gastos.");
+        if (opening is not null && kind == AccountKind.CreditCard) v.Add("openingBalanceMinor", CardOpeningMessage);
         if (!v.IsValid) return v.Problem();
         var owner = ctx.User.UserId();
         var account = new Account { OwnerId = owner, Name = name!, Kind = kind, Currency = currency, Last4 = last4, OpeningBalanceMinor = opening, OpeningDate = openingDate };
@@ -108,7 +123,12 @@ public static class CatalogEndpoints
         var account = await db.Accounts.SingleOrDefaultAsync(a => a.Id == id && a.OwnerId == owner && a.DeletedAt == null, ct);
         if (account is null) return Problems.NotFound();
         if (account.Version != req.Version) return Problems.VersionConflict(AccountDto(account));
-        if (opening is not null && account.Kind == AccountKind.CreditCard) return Problems.Unprocessable("Las tarjetas no llevan saldo inicial.");
+        if (opening is not null && account.Kind == AccountKind.CreditCard)
+        {
+            // Misma regla y mismo código (400 por campo) que al crear la cuenta.
+            v.Add("openingBalanceMinor", CardOpeningMessage);
+            return v.Problem();
+        }
         account.Name = name!;
         account.Last4 = last4;
         account.OpeningBalanceMinor = opening;
@@ -134,11 +154,13 @@ public static class CatalogEndpoints
         return await Db.SaveVersionedAsync(db, ct) == SaveOutcome.Ok ? TypedResults.Ok(AccountDto(account)) : Problems.VersionConflict();
     }
 
-    private static async Task<IResult> RestoreAccount(Guid id, HttpContext ctx, AppDbContext db, AuditLog audit, CancellationToken ct)
+    /// <summary>Restaura una cuenta archivada. Igual que el archivado, exige la versión actual (?version=).</summary>
+    private static async Task<IResult> RestoreAccount(Guid id, long? version, HttpContext ctx, AppDbContext db, AuditLog audit, CancellationToken ct)
     {
         var owner = ctx.User.UserId();
         var account = await db.Accounts.SingleOrDefaultAsync(a => a.Id == id && a.OwnerId == owner && a.DeletedAt != null, ct);
         if (account is null) return Problems.NotFound();
+        if (version is null || account.Version != version) return Problems.VersionConflict(AccountDto(account));
         account.DeletedAt = null;
         audit.Add(db, "account.restore", "success", "account", id);
         return await Db.SaveVersionedAsync(db, ct) switch
@@ -156,6 +178,14 @@ public static class CatalogEndpoints
         if (includeDeleted != true) q = q.Where(c => c.DeletedAt == null);
         var list = await q.OrderBy(c => c.Name).ToListAsync(ct);
         return TypedResults.Ok(list.Select(CategoryDto));
+    }
+
+    /// <summary>Una categoría por ID (también archivada). Ajena o inexistente → 404.</summary>
+    private static async Task<IResult> GetCategory(Guid id, HttpContext ctx, AppDbContext db, CancellationToken ct)
+    {
+        var owner = ctx.User.UserId();
+        var category = await db.Categories.AsNoTracking().SingleOrDefaultAsync(c => c.Id == id && c.OwnerId == owner, ct);
+        return category is null ? Problems.NotFound() : TypedResults.Ok(CategoryDto(category));
     }
 
     private static async Task<IResult> CreateCategory(CategoryRequest req, HttpContext ctx, AppDbContext db, AuditLog audit, CancellationToken ct)
@@ -204,11 +234,13 @@ public static class CatalogEndpoints
         return await Db.SaveVersionedAsync(db, ct) == SaveOutcome.Ok ? TypedResults.Ok(CategoryDto(category)) : Problems.VersionConflict();
     }
 
-    private static async Task<IResult> RestoreCategory(Guid id, HttpContext ctx, AppDbContext db, AuditLog audit, CancellationToken ct)
+    /// <summary>Restaura una categoría archivada. Igual que el archivado, exige la versión actual (?version=).</summary>
+    private static async Task<IResult> RestoreCategory(Guid id, long? version, HttpContext ctx, AppDbContext db, AuditLog audit, CancellationToken ct)
     {
         var owner = ctx.User.UserId();
         var category = await db.Categories.SingleOrDefaultAsync(c => c.Id == id && c.OwnerId == owner && c.DeletedAt != null, ct);
         if (category is null) return Problems.NotFound();
+        if (version is null || category.Version != version) return Problems.VersionConflict(CategoryDto(category));
         category.DeletedAt = null;
         audit.Add(db, "category.restore", "success", "category", id);
         return await Db.SaveVersionedAsync(db, ct) switch
@@ -217,21 +249,6 @@ public static class CatalogEndpoints
             SaveOutcome.Duplicate => Problems.Conflict("Ya existe otra categoría activa con ese nombre."),
             _ => Problems.VersionConflict(),
         };
-    }
-}
-
-public static class SignedMinor
-{
-    public static bool TryParse(string? value, out long minor)
-    {
-        minor = 0;
-        if (string.IsNullOrEmpty(value)) return false;
-        var negative = value[0] == '-';
-        var digits = negative ? value[1..] : value;
-        if (digits == "0" && !negative) return true;
-        if (!Money.TryParseMinor(digits, out var abs)) return false;
-        minor = negative ? -abs : abs;
-        return true;
     }
 }
 

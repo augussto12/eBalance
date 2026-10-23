@@ -178,8 +178,11 @@ public class FinanceTests(PostgresFixture pg)
         var e = await a.PostJson("/api/v1/entries", new { kind = "expense", concept = "Borrable", amountMinor = "100", currency = "ARS", date = "2026-10-05" });
         Assert.Equal(HttpStatusCode.OK, (await a.DeleteAsync($"/api/v1/entries/{e.Str("id")}?version=1")).StatusCode);
         Assert.Equal(0, (await a.GetJson("/api/v1/entries")).GetProperty("total").GetInt32());
-        Assert.Equal(1, (await a.GetJson("/api/v1/trash")).GetArrayLength());
-        Assert.Equal(HttpStatusCode.OK, (await a.PostAsync($"/api/v1/entries/{e.Str("id")}/restore", null)).StatusCode);
+        var trash = await a.GetJson("/api/v1/trash");
+        Assert.Equal(1, trash.GetArrayLength());
+        // Restaurar exige la versión actual, igual que borrar (la papelera la informa).
+        Assert.Equal(HttpStatusCode.Conflict, (await a.PostAsync($"/api/v1/entries/{e.Str("id")}/restore", null)).StatusCode);
+        Assert.Equal(HttpStatusCode.OK, (await a.PostAsync($"/api/v1/entries/{e.Str("id")}/restore?version={trash[0].GetProperty("version").GetInt64()}", null)).StatusCode);
         Assert.Equal(1, (await a.GetJson("/api/v1/entries")).GetProperty("total").GetInt32());
     }
 

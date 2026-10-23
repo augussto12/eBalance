@@ -178,14 +178,25 @@ public static class ImportExportEndpoints
         {
             await using var tx = await db.Database.BeginTransactionAsync(System.Data.IsolationLevel.Serializable, ct);
             var importer = new Importer(db, owner, batch.Id, now);
-            var result = batch.Format == ImportParser.LegacyFormat
-                ? await importer.LegacyAsync(records, kinds, ct)
-                : await importer.ExportAsync(records, ct);
+            ImportResult result;
+            try
+            {
+                result = batch.Format == ImportParser.LegacyFormat
+                    ? await importer.LegacyAsync(records, kinds, ct)
+                    : await importer.ExportAsync(records, ct);
+            }
+            catch (DbUpdateException ex)
+            {
+                // Los guardados intermedios de la restauración también son atómicos: nada queda escrito.
+                await tx.RollbackAsync(ct);
+                db.ChangeTracker.Clear();
+                return SaveFailure(ex);
+            }
             if (result.Error is not null)
             {
                 await tx.RollbackAsync(ct);
                 db.ChangeTracker.Clear();
-                return Problems.Conflict(result.Error);
+                return result.Invalid ? Problems.Unprocessable(result.Error) : Problems.Conflict(result.Error);
             }
             batch.Status = ImportStatus.Committed;
             batch.IdempotencyKey = key;
@@ -198,17 +209,25 @@ public static class ImportExportEndpoints
                 await db.SaveChangesAsync(ct);
                 await tx.CommitAsync(ct);
             }
-            catch (DbUpdateException)
+            catch (DbUpdateException ex)
             {
                 await tx.RollbackAsync(ct);
                 db.ChangeTracker.Clear();
-                return Problems.Conflict("Otra importación se guardó al mismo tiempo. Generá una vista previa nueva.");
+                return SaveFailure(ex);
             }
             return TypedResults.Ok(new { batchId = batch.Id, status = "committed", result = result.Summary });
         });
     }
 
-    private sealed record ImportResult(Dictionary<string, int> Summary, string? Error);
+    /// <summary>Choque con otra escritura simultánea → 409; dato que la base rechaza (regla del archivo) → 422. Nunca 500.</summary>
+    private static IResult SaveFailure(DbUpdateException ex) =>
+        Db.IsUniqueViolation(ex) || ex is DbUpdateConcurrencyException
+            || ex.InnerException is Npgsql.PostgresException { SqlState: Npgsql.PostgresErrorCodes.SerializationFailure }
+            ? Problems.Conflict("Otra importación se guardó al mismo tiempo. Generá una vista previa nueva.")
+            : Problems.Unprocessable("El archivo tiene datos que no cumplen las reglas de la aplicación. No se importó nada.");
+
+    /// <summary>Invalid: el problema es del contenido del archivo (422); si no, es un conflicto con datos existentes (409).</summary>
+    private sealed record ImportResult(Dictionary<string, int> Summary, string? Error, bool Invalid = false);
 
     private sealed class Importer(AppDbContext db, Guid owner, Guid batchId, DateTimeOffset now)
     {
@@ -307,8 +326,13 @@ public static class ImportExportEndpoints
         private Guid? Ref(string sourceTypeSuffix, string? sourceId) =>
             sourceId is null ? null : _map.TryGetValue("export_v2_" + sourceTypeSuffix + ":" + sourceId, out var g) ? g : null;
 
+        private ImportResult Invalid(string error) => new(_summary, error, Invalid: true);
+
         public async Task<ImportResult> ExportAsync(List<NormalizedRecord> records, CancellationToken ct)
         {
+            // Defensa en profundidad: las mismas reglas entre registros que la vista previa, antes de escribir nada.
+            var inconsistent = ExportConsistency.Check(records);
+            if (inconsistent.Count > 0) return Invalid("El archivo no es coherente: " + inconsistent[0]);
             var existing = await ExistingAsync(records, ct);
             foreach (var r in records)
             {
@@ -361,7 +385,7 @@ public static class ImportExportEndpoints
                     AccountId = Ref("account", f["accountId"]), CategoryId = Ref("category", f["categoryId"]), DeletedAt = Deleted(f),
                 };
                 if (f["accountId"] is not null && e.AccountId is null || f["categoryId"] is not null && e.CategoryId is null)
-                    return new ImportResult(_summary, "Un movimiento referencia una cuenta o categoría que no está en el archivo.");
+                    return Invalid("Un movimiento referencia una cuenta o categoría que no está en el archivo.");
                 db.Entries.Add(e);
                 Track(r, "entry", e.Id);
             }
@@ -377,7 +401,7 @@ public static class ImportExportEndpoints
                     DisbursementMinor = f["disbursementMinor"] is { } dm ? M(dm) : null, DisbursementDate = f["disbursementDate"] is { } dd ? D(dd) : null,
                     DisbursementAccountId = Ref("account", f["disbursementAccountId"]), DeletedAt = Deleted(f),
                 };
-                if (plan.PaidBeforeCount >= plan.Count) return new ImportResult(_summary, "Un plan tiene más cuotas pagadas que cuotas.");
+                if (plan.PaidBeforeCount >= plan.Count) return Invalid("Un plan tiene más cuotas pagadas que cuotas.");
                 plan.Installments = PlanSchedule.Build(plan);
                 var amounts = f["installmentAmounts"]!.Split(',').Select(M).ToArray();
                 for (var i = 0; i < amounts.Length; i++) plan.Installments[i].AmountMinor = amounts[i];
@@ -389,7 +413,7 @@ public static class ImportExportEndpoints
                 var f = r.Fields;
                 var from = Ref("account", f["fromAccountId"]);
                 var to = Ref("account", f["toAccountId"]);
-                if (from is null || to is null || from == to) return new ImportResult(_summary, "Una transferencia referencia cuentas inválidas.");
+                if (from is null || to is null || from == to) return Invalid("Una transferencia referencia cuentas inválidas.");
                 var t = new Transfer
                 {
                     OwnerId = owner, FromAccountId = from.Value, ToAccountId = to.Value, Currency = Enum.Parse<Currency>(f["currency"]!),
@@ -404,7 +428,7 @@ public static class ImportExportEndpoints
             {
                 var f = r.Fields;
                 var source = Ref("account", f["sourceAccountId"]);
-                if (source is null) return new ImportResult(_summary, "Un pago referencia una cuenta que no está en el archivo.");
+                if (source is null) return Invalid("Un pago referencia una cuenta que no está en el archivo.");
                 var p = new Payment
                 {
                     OwnerId = owner, SourceAccountId = source.Value, Date = D(f["date"]), Currency = Enum.Parse<Currency>(f["currency"]!),
@@ -422,7 +446,7 @@ public static class ImportExportEndpoints
                         var entryId = Ref("entry", bits[1]);
                         var entry = entryId is null ? null : await db.Entries.Include(e => e.Account).SingleOrDefaultAsync(e => e.Id == entryId && e.OwnerId == owner, ct);
                         if (entry is null || entry.Account?.Kind != AccountKind.CreditCard || entry.AmountMinor - entry.PaidMinor < amount)
-                            return new ImportResult(_summary, "Un pago no coincide con los gastos del archivo.");
+                            return Invalid("Un pago no coincide con los gastos del archivo.");
                         entry.PaidMinor += amount;
                         p.Allocations.Add(new PaymentAllocation { OwnerId = owner, PaymentId = p.Id, EntryId = entry.Id, AmountMinor = amount });
                     }
@@ -431,12 +455,12 @@ public static class ImportExportEndpoints
                         var planId = Ref("plan", bits[1]);
                         var number = L(bits[2]);
                         var inst = planId is null ? null : await db.Installments.SingleOrDefaultAsync(i => i.PlanId == planId && i.Number == number && i.OwnerId == owner, ct);
-                        if (inst is null || inst.PendingMinor < amount) return new ImportResult(_summary, "Un pago no coincide con las cuotas del archivo.");
+                        if (inst is null || inst.PendingMinor < amount) return Invalid("Un pago no coincide con las cuotas del archivo.");
                         inst.PaidMinor += amount;
                         p.Allocations.Add(new PaymentAllocation { OwnerId = owner, PaymentId = p.Id, InstallmentId = inst.Id, AmountMinor = amount });
                     }
                 }
-                if (sum != p.AmountMinor) return new ImportResult(_summary, "Un pago no suma lo mismo que sus asignaciones.");
+                if (sum != p.AmountMinor) return Invalid("Un pago no suma lo mismo que sus asignaciones.");
                 db.Payments.Add(p);
                 Track(r, "payment", p.Id);
             }

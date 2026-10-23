@@ -199,10 +199,15 @@ public static class ImportParser
             };
             o.Records.Add(new NormalizedRecord("legacy_v1", id!, isPlan ? "plan" : "entry", Hash(fields), fields));
         }
+        // Siempre: aunque el archivo solo tenga ingresos y gastos, tampoco trae saldos de cuentas.
+        o.Warnings.Add(LegacyLimitsWarning);
         if (o.Records.Any(r => r.Target == "plan"))
-            o.Warnings.Add("El respaldo original no conoce pagos, saldos ni vencimientos exactos: las cuotas se importan como pendientes, aunque sean de meses pasados.");
+            o.Warnings.Add("Las cuotas se importan como pendientes, aunque sean de meses pasados, con vencimientos calculados desde la fecha del registro original.");
         o.Warnings.Add("El archivo original está en texto claro. Cuando termines, borrá las copias que no necesites.");
     }
+
+    public const string LegacyLimitsWarning =
+        "El respaldo original no conoce saldos, pagos ni vencimientos exactos: las cuentas se crean sin saldo inicial, no se registra ningún pago y las fechas de las cuotas son estimadas.";
 
     private static readonly string[] ExportKeys = ["format", "version", "exportedAt", "accounts", "categories", "entries", "plans", "payments", "transfers"];
 
@@ -224,11 +229,11 @@ public static class ImportParser
         {
             OnlyKeys(el, o, where, "id", "name", "kind", "currency", "last4", "openingBalanceMinor", "openingDate", "deleted");
             var kind = Str(el, "kind", 16, o, where);
-            if (kind is not null && !Api.ApiMaps.AccountKinds.ContainsKey(kind)) Error(o, $"{where}: tipo de cuenta no válido.");
+            if (kind is not null && !ApiMaps.AccountKinds.ContainsKey(kind)) Error(o, $"{where}: tipo de cuenta no válido.");
             var last4 = Str(el, "last4", 4, o, where, required: false);
             if (last4 is not null && (last4.Length != 4 || !last4.All(char.IsAsciiDigit))) Error(o, $"{where}: últimos cuatro dígitos no válidos.");
             var opening = Str(el, "openingBalanceMinor", 19, o, where, required: false);
-            if (opening is not null && !Api.SignedMinor.TryParse(opening, out _)) Error(o, $"{where}: saldo inicial no válido.");
+            if (opening is not null && !SignedMinor.TryParse(opening, out _)) Error(o, $"{where}: saldo inicial no válido.");
             return new()
             {
                 ["name"] = Str(el, "name", 60, o, where), ["kind"] = kind, ["currency"] = Currency(el, o, where), ["last4"] = last4,
@@ -239,14 +244,14 @@ public static class ImportParser
         {
             OnlyKeys(el, o, where, "id", "name", "kind", "deleted");
             var kind = Str(el, "kind", 16, o, where);
-            if (kind is not null && !Api.ApiMaps.CategoryKinds.ContainsKey(kind)) Error(o, $"{where}: tipo de categoría no válido.");
+            if (kind is not null && !ApiMaps.CategoryKinds.ContainsKey(kind)) Error(o, $"{where}: tipo de categoría no válido.");
             return new() { ["name"] = Str(el, "name", 40, o, where), ["kind"] = kind, ["deleted"] = Bool(el, "deleted") };
         }, "category");
         Each(root, "entries", o, (el, where) =>
         {
             OnlyKeys(el, o, where, "id", "kind", "concept", "note", "amountMinor", "currency", "date", "accountId", "categoryId", "deleted");
             var kind = Str(el, "kind", 10, o, where);
-            if (kind is not null && !Api.ApiMaps.EntryKinds.ContainsKey(kind)) Error(o, $"{where}: tipo no válido.");
+            if (kind is not null && !ApiMaps.EntryKinds.ContainsKey(kind)) Error(o, $"{where}: tipo no válido.");
             return new()
             {
                 ["kind"] = kind, ["concept"] = Str(el, "concept", 90, o, where), ["note"] = Str(el, "note", 500, o, where, required: false),
@@ -260,7 +265,7 @@ public static class ImportParser
             OnlyKeys(el, o, where, "id", "kind", "concept", "note", "totalMinor", "count", "currency", "firstDueDate", "accountId", "categoryId",
                 "paidBeforeCount", "remainingOnly", "disbursementMinor", "disbursementDate", "disbursementAccountId", "installments", "deleted");
             var kind = Str(el, "kind", 10, o, where);
-            if (kind is not null && !Api.ApiMaps.PlanKinds.ContainsKey(kind)) Error(o, $"{where}: tipo de plan no válido.");
+            if (kind is not null && !ApiMaps.PlanKinds.ContainsKey(kind)) Error(o, $"{where}: tipo de plan no válido.");
             var count = Int(el, "count", 1, Money.MaxInstallments, o, where);
             var paidBefore = Int(el, "paidBeforeCount", 0, Money.MaxInstallments - 1, o, where);
             var total = MinorString(el, "totalMinor", o, where);
@@ -304,8 +309,8 @@ public static class ImportParser
                     if (a.ValueKind != JsonValueKind.Object) { Error(o, $"{where}: asignación no válida."); continue; }
                     OnlyKeys(a, o, where + " asignación", "planId", "installmentNumber", "entryId", "amountMinor");
                     var amt = MinorString(a, "amountMinor", o, where);
-                    var entryId = Str(a, "entryId", 100, o, where, required: false);
-                    var planId = Str(a, "planId", 100, o, where, required: false);
+                    var entryId = SafeId(Str(a, "entryId", 100, o, where, required: false), o, where);
+                    var planId = SafeId(Str(a, "planId", 100, o, where, required: false), o, where);
                     var number = Int(a, "installmentNumber", 1, Money.MaxInstallments, o, where, required: planId is not null);
                     if ((entryId is null) == (planId is null)) Error(o, $"{where}: cada asignación va a una cuota o a un gasto.");
                     allocations.Add(entryId is not null ? $"e:{entryId}:{amt}" : $"i:{planId}:{number}:{amt}");
@@ -328,6 +333,19 @@ public static class ImportParser
                 ["note"] = Str(el, "note", 200, o, where, required: false), ["deleted"] = Bool(el, "deleted"),
             };
         }, "transfer");
+        // Reglas entre registros (moneda, tarjetas, transferencias, pagos): solo si cada registro es válido por sí mismo.
+        if (o.Errors.Count == 0)
+        {
+            foreach (var e in ExportConsistency.Check(o.Records)) Error(o, e);
+        }
+    }
+
+    /// <summary>Identificadores de la exportación: UUID u otro texto simple. Sin «:», «|» ni «,», que separan campos normalizados.</summary>
+    private static string? SafeId(string? id, ParseOutcome o, string where)
+    {
+        if (id is null || id.All(c => char.IsAsciiLetterOrDigit(c) || c is '-' or '_')) return id;
+        Error(o, $"{where}: identificador «{Trunc(id)}» no válido.");
+        return null;
     }
 
     private static string? Bool(JsonElement el, string name) =>
@@ -358,7 +376,7 @@ public static class ImportParser
             var where = $"{list} {index}";
             if (el.ValueKind != JsonValueKind.Object) { Error(o, $"{where}: no es un objeto."); continue; }
             var before = o.Errors.Count;
-            var id = Str(el, "id", 100, o, where);
+            var id = SafeId(Str(el, "id", 100, o, where), o, where);
             var fields = parse(el, where);
             if (id is not null && !seen.Add(id)) Error(o, $"{where}: id repetido.");
             if (o.Errors.Count != before) continue;

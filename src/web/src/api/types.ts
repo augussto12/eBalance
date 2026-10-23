@@ -23,6 +23,8 @@ export interface Account {
   version: number;
   deletedAt: string | null;
   cashBalanceMinor: string | null;
+  /** Día (del calendario del propietario) hasta el que se sumaron movimientos al saldo: los de fecha futura no cuentan. */
+  cashBalanceAsOf: string | null;
   pendingObligationsMinor: string | null;
 }
 
@@ -164,6 +166,19 @@ export interface Transfer {
   deletedAt: string | null;
 }
 
+/** Qué canceló un pago: una cuota de un plan o un consumo cargado a tarjeta. */
+export interface PaymentAllocation {
+  installmentId: string | null;
+  entryId: string | null;
+  amountMinor: string;
+  planId: string | null;
+  planKind: 'card' | 'loan' | null;
+  concept: string | null;
+  installmentNumber: number | null;
+  installmentCount: number | null;
+  dueDate: string | null;
+}
+
 export interface Payment {
   id: string;
   sourceAccountId: string;
@@ -172,8 +187,23 @@ export interface Payment {
   currency: Currency;
   amountMinor: string;
   note: string | null;
-  allocations: { installmentId: string | null; entryId: string | null; amountMinor: string }[];
+  allocations: PaymentAllocation[];
   version: number;
+  createdAt: string;
+  /** Fecha de reversión; el pago revertido queda en el historial. */
+  reversedAt: string | null;
+  deletedAt: string | null;
+}
+
+/** Filtros de GET /payments. */
+export interface PaymentFilter {
+  planId?: string;
+  installmentId?: string;
+  entryId?: string;
+  targetAccountId?: string;
+  kind?: 'card' | 'loan';
+  currency?: Currency;
+  includeReversed?: boolean;
 }
 
 export interface SessionInfo {
@@ -194,6 +224,8 @@ export interface TrashItem {
   amountMinor: string;
   date: string;
   deletedAt: string;
+  /** Versión actual: la restauración la exige igual que el borrado. */
+  version: number;
 }
 
 export interface ImportPreview {

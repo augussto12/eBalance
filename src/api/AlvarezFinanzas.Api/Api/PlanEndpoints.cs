@@ -74,7 +74,7 @@ public static class PlanEndpoints
             currentInstallment = current?.Number ?? 0,
             remainingInstallments = inst.Count(i => i.DueDate > today),
             nextDue = next is null ? null : new { number = next.Number, dueDate = next.DueDate.Api(), pendingMinor = Money.ToApi(next.PendingMinor) },
-            hasPayments = inst.Any(i => i.PaidMinor > 0),
+            hasPayments = HasAppliedPayments(p), // bloqueo del cronograma en la UI: misma condición que Update y Delete
             finished = inst.All(i => i.PendingMinor == 0),
             version = p.Version,
             deletedAt = p.DeletedAt,
@@ -115,7 +115,12 @@ public static class PlanEndpoints
         if (!v.IsValid) return v.Problem();
         var amounts = Money.Distribute(total, req.Count!.Value);
         var lastDue = FinanceCalendar.DueDate(first, req.Count.Value);
-        if (!FinanceCalendar.IsInRange(lastDue)) return Problems.Unprocessable("La última cuota queda fuera del rango de fechas permitido.");
+        // Misma regla y mismo código (400 por campo) que al crear o editar el plan.
+        if (!FinanceCalendar.IsInRange(lastDue))
+        {
+            v.Add("firstDueDate", "La última cuota queda fuera del rango de fechas permitido.");
+            return v.Problem();
+        }
         return TypedResults.Ok(new
         {
             totalMinor = Money.ToApi(total),
@@ -223,8 +228,9 @@ public static class PlanEndpoints
     }
 
     /// <summary>
-    /// Edición sin reescribir historia: con cuotas pagadas (o declaradas pagadas) se bloquea el cambio de total, cantidad,
-    /// fecha o moneda; para eso existe el ajuste explícito de pendientes.
+    /// Edición sin reescribir historia: con pagos aplicados a alguna cuota se bloquea el cambio de total, cantidad,
+    /// fecha, moneda o cuotas declaradas pagadas; para eso existe el ajuste explícito de pendientes. Sin pagos aplicados
+    /// (nunca pagado, o con todos sus pagos revertidos) el cronograma se recalcula.
     /// </summary>
     private static async Task<IResult> Update(Guid id, PlanRequest req, HttpContext ctx, AppDbContext db, AuditLog audit, TimeProvider clock, CancellationToken ct)
     {
@@ -240,12 +246,11 @@ public static class PlanEndpoints
 
         var scheduleChanged = val.Total != plan.TotalMinor || val.Count != plan.Count || val.FirstDue != plan.FirstDueDate
                               || val.Currency != plan.Currency || val.PaidBefore != plan.PaidBeforeCount;
-        var hasPaid = plan.Installments.Any(i => i.PaidMinor > 0);
-        if (scheduleChanged && hasPaid)
+        // Misma condición que «hasPayments» del DTO (bloqueo en la UI) y que el borrado: solo cuentan pagos vigentes.
+        if (scheduleChanged && HasAppliedPayments(plan))
         {
-            return Problems.Conflict("El plan tiene cuotas pagadas: no se puede modificar total, cantidad, fecha o moneda. Usá «Ajustar pendientes».");
+            return Problems.PaymentsApplied("El plan tiene cuotas pagadas: no se puede modificar total, cantidad, fecha o moneda. Usá «Ajustar pendientes» o revertí los pagos.");
         }
-        if (val.Currency != plan.Currency && hasPaid) return Problems.Conflict("El plan tiene pagos: no se puede cambiar la moneda.");
 
         plan.Concept = val.Concept;
         plan.Note = val.Note;
@@ -264,13 +269,58 @@ public static class PlanEndpoints
             plan.FirstDueDate = val.FirstDue;
             plan.Currency = val.Currency;
             plan.PaidBeforeCount = val.PaidBefore;
-            db.Installments.RemoveRange(plan.Installments);
-            plan.Installments = PlanSchedule.Build(plan);
-            db.Installments.AddRange(plan.Installments);
+            if (!await RebuildScheduleAsync(db, plan, ct))
+            {
+                db.ChangeTracker.Clear();
+                return Problems.PaymentsApplied("El plan tiene pagos aplicados. Revertí esos pagos antes de cambiar el cronograma.");
+            }
         }
         db.Entry(plan).Property(p => p.Version).IsModified = true;
         audit.Add(db, "plan.update", "success", "plan", id);
         return await Db.SaveVersionedAsync(db, ct) == SaveOutcome.Ok ? TypedResults.Ok(Dto(plan, today, true)) : Problems.VersionConflict();
+    }
+
+    /// <summary>Hay pagos vigentes aplicados a alguna cuota. Un pago revertido ya devolvió su importe y no cuenta.</summary>
+    internal static bool HasAppliedPayments(InstallmentPlan plan) => plan.Installments.Any(i => i.PaidMinor > 0);
+
+    /// <summary>
+    /// Recalcula el cronograma de un plan SIN pagos vigentes. Las cuotas que siguen existiendo (mismo número) se
+    /// actualizan en su fila; las que sobran se eliminan. Un pago revertido conserva su fila, su auditoría y sus
+    /// asignaciones a las cuotas que siguen existiendo; solo se quitan sus asignaciones a cuotas que dejan de existir,
+    /// porque ya no tienen a qué apuntar (antes, la FK de esas asignaciones hacía fallar la edición con 500).
+    /// </summary>
+    private static async Task<bool> RebuildScheduleAsync(AppDbContext db, InstallmentPlan plan, CancellationToken ct)
+    {
+        var rebuilt = PlanSchedule.Build(plan);
+        var current = plan.Installments.ToDictionary(i => i.Number);
+        foreach (var fresh in rebuilt)
+        {
+            if (current.TryGetValue(fresh.Number, out var row))
+            {
+                row.AmountMinor = fresh.AmountMinor;
+                row.DueDate = fresh.DueDate;
+                row.DeclaredPaid = fresh.DeclaredPaid;
+                row.PaidMinor = 0;
+            }
+            else
+            {
+                plan.Installments.Add(fresh);
+                db.Installments.Add(fresh);
+            }
+        }
+        var removed = plan.Installments.Where(i => i.Number > plan.Count).ToList();
+        if (removed.Count == 0) return true;
+        var removedIds = removed.Select(i => i.Id).ToList();
+        var stale = await db.PaymentAllocations
+            .Where(a => a.OwnerId == plan.OwnerId && a.InstallmentId != null && removedIds.Contains(a.InstallmentId.Value))
+            .Include(a => a.Payment)
+            .ToListAsync(ct);
+        // Defensa: una asignación de un pago vigente nunca se borra (no debería existir con PaidMinor en cero).
+        if (stale.Any(a => a.Payment!.DeletedAt is null)) return false;
+        db.PaymentAllocations.RemoveRange(stale);
+        db.Installments.RemoveRange(removed);
+        foreach (var r in removed) plan.Installments.Remove(r);
+        return true;
     }
 
     /// <summary>Redistribuye un nuevo total pendiente solo entre cuotas sin pagos. Las pagadas no se tocan.</summary>
@@ -308,18 +358,21 @@ public static class PlanEndpoints
         if (plan is null) return Problems.NotFound();
         var today = FinanceCalendar.Today(clock, FinanceCalendar.ArgentinaZone);
         if (version is null || plan.Version != version) return Problems.VersionConflict(Dto(plan, today));
-        if (plan.Installments.Any(i => i.PaidMinor > 0))
-            return Problems.Conflict("El plan tiene pagos aplicados. Revertí esos pagos antes de eliminarlo.");
+        if (HasAppliedPayments(plan))
+            return Problems.PaymentsApplied("El plan tiene pagos aplicados. Revertí esos pagos antes de eliminarlo.");
         plan.DeletedAt = clock.GetUtcNow();
         audit.Add(db, "plan.delete", "success", "plan", id);
         return await Db.SaveVersionedAsync(db, ct) == SaveOutcome.Ok ? TypedResults.Ok(Dto(plan, today)) : Problems.VersionConflict();
     }
 
-    private static async Task<IResult> Restore(Guid id, HttpContext ctx, AppDbContext db, AuditLog audit, TimeProvider clock, CancellationToken ct)
+    /// <summary>Restaura desde la papelera. Igual que el borrado, exige la versión actual (?version=).</summary>
+    private static async Task<IResult> Restore(Guid id, long? version, HttpContext ctx, AppDbContext db, AuditLog audit, TimeProvider clock, CancellationToken ct)
     {
         var owner = ctx.User.UserId();
         var plan = await LoadAsync(db, owner, id, true, ct, tracking: true);
         if (plan is null) return Problems.NotFound();
+        if (version is null || plan.Version != version)
+            return Problems.VersionConflict(Dto(plan, FinanceCalendar.Today(clock, FinanceCalendar.ArgentinaZone)));
         plan.DeletedAt = null;
         audit.Add(db, "plan.restore", "success", "plan", id);
         return await Db.SaveVersionedAsync(db, ct) == SaveOutcome.Ok

@@ -126,24 +126,24 @@ public static class ReportEndpoints
         haystack is not null && System.Globalization.CultureInfo.GetCultureInfo("es-AR").CompareInfo
             .IndexOf(haystack, needle, System.Globalization.CompareOptions.IgnoreCase | System.Globalization.CompareOptions.IgnoreNonSpace) >= 0;
 
-    /// <summary>Papelera: registros eliminados de forma reversible.</summary>
+    /// <summary>Papelera: registros eliminados de forma reversible. Incluye la versión que exige la restauración.</summary>
     private static async Task<IResult> Trash(HttpContext ctx, AppDbContext db, CancellationToken ct)
     {
         var owner = ctx.User.UserId();
         var entries = await db.Entries.AsNoTracking().Where(e => e.OwnerId == owner && e.DeletedAt != null)
             .OrderByDescending(e => e.DeletedAt).Take(100)
-            .Select(e => new { type = "entry", id = e.Id, concept = e.Concept, currency = e.Currency.ToString(), amountMinor = e.AmountMinor, date = e.EffectiveDate, deletedAt = e.DeletedAt })
+            .Select(e => new { type = "entry", id = e.Id, concept = e.Concept, currency = e.Currency.ToString(), amountMinor = e.AmountMinor, date = e.EffectiveDate, deletedAt = e.DeletedAt, version = e.Version })
             .ToListAsync(ct);
         var plans = await db.Plans.AsNoTracking().Where(p => p.OwnerId == owner && p.DeletedAt != null)
             .OrderByDescending(p => p.DeletedAt).Take(100)
-            .Select(p => new { type = p.Kind == PlanKind.Card ? "card" : "loan", id = p.Id, concept = p.Concept, currency = p.Currency.ToString(), amountMinor = p.TotalMinor, date = p.FirstDueDate, deletedAt = p.DeletedAt })
+            .Select(p => new { type = p.Kind == PlanKind.Card ? "card" : "loan", id = p.Id, concept = p.Concept, currency = p.Currency.ToString(), amountMinor = p.TotalMinor, date = p.FirstDueDate, deletedAt = p.DeletedAt, version = p.Version })
             .ToListAsync(ct);
         var transfers = await db.Transfers.AsNoTracking().Where(t => t.OwnerId == owner && t.DeletedAt != null)
             .OrderByDescending(t => t.DeletedAt).Take(100)
-            .Select(t => new { type = "transfer", id = t.Id, concept = "Transferencia", currency = t.Currency.ToString(), amountMinor = t.AmountMinor, date = t.Date, deletedAt = t.DeletedAt })
+            .Select(t => new { type = "transfer", id = t.Id, concept = "Transferencia", currency = t.Currency.ToString(), amountMinor = t.AmountMinor, date = t.Date, deletedAt = t.DeletedAt, version = t.Version })
             .ToListAsync(ct);
         var all = entries.Concat(plans).Concat(transfers).OrderByDescending(x => x.deletedAt)
-            .Select(x => new { x.type, x.id, x.concept, x.currency, amountMinor = Money.ToApi(x.amountMinor), date = x.date.Api(), x.deletedAt });
+            .Select(x => new { x.type, x.id, x.concept, x.currency, amountMinor = Money.ToApi(x.amountMinor), date = x.date.Api(), x.deletedAt, x.version });
         return TypedResults.Ok(all);
     }
 }
