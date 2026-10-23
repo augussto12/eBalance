@@ -1,6 +1,8 @@
 # Runbook — VPS, despliegue, backups y recuperación
 
-Todos los comandos se probaron en un entorno local equivalente (Docker Compose + Nginx con TLS), salvo los marcados **[no probado en VPS]**. En la VPS real todavía no se ejecutó nada: ver `IMPLEMENTATION-STATUS.md`.
+Todos los comandos se probaron en un entorno local equivalente (Docker Compose + Nginx con TLS), salvo los marcados **[no probado …]**. En la VPS real todavía no se ejecutó nada: ver `IMPLEMENTATION-STATUS.md`. El entorno de prueba no tiene systemd: las unidades se validaron con `systemd-analyze verify` y sus scripts se ejecutaron a mano, pero los timers y `OnFailure=` no se vieron disparar **[no probado con systemd]**.
+
+Los scripts de operación se corren como **root** (`sudo`) en la VPS: `.env` y los secretos son de root y los scripts ajustan los permisos que necesita el contenedor de backup, que corre sin root.
 
 ## 0. Requisitos de la VPS
 
@@ -54,7 +56,7 @@ Las re-ejecuciones reconocen el sitio propio y mantienen la dirección guardada 
 3. `TLS_MODE=sslip` existe, pero **no se recomienda** para datos financieros. `*.sslip.io` es un DNS de terceros que no está en la Public Suffix List: comparte «sitio» y cupo de certificados con miles de páginas ajenas, incluido phishing.
 4. Con dominio propio: `sudo PUBLIC_HOST=finanzas.tu-dominio bash vps-install.sh` (registro A apuntando a la VPS).
 
-**Qué hace al final:** construye las imágenes, migra con el rol migrador, levanta la app y corre los smoke tests y el preflight. Hace un backup y una prueba de restauración aislada, e instala los timers de certificado, backup y mantenimiento. Por último te pide crear tu usuario: la contraseña se escribe oculta y no queda en archivos ni en el historial. El registro sin secretos queda en `/srv/alvarez-finanzas/install.log`.
+**Qué hace al final:** construye las imágenes, migra con el rol migrador, levanta la app y corre los smoke tests y el preflight. Hace un backup y una prueba de restauración aislada, e instala los timers de certificado, backup, mantenimiento, chequeo horario y prueba de restauración mensual, con el aviso de fallas (§3). Por último te pide crear tu usuario: la contraseña se escribe oculta y no queda en archivos ni en el historial. El registro sin secretos queda en `/srv/alvarez-finanzas/install.log`.
 
 Después de instalar, guardá en tu gestor de contraseñas, **fuera del servidor**:
 
@@ -98,45 +100,91 @@ En el sitio anterior: «↓ Exportar respaldo» (JSON). En la app nueva: Configu
 
 | Tarea | Comando |
 |---|---|
-| Actualizar a un commit nuevo | `git pull && ./infra/scripts/deploy.sh` (backup → migración → arranque → smoke) |
-| Volver a la versión anterior | `./infra/scripts/deploy.sh --rollback <tag>` (no revierte migraciones; ver 6) |
+| Actualizar a un commit nuevo | `git pull && sudo ./infra/scripts/deploy.sh` (preflight → build → backup → migración → arranque → smoke) |
+| Volver a la versión anterior | `sudo ./infra/scripts/deploy.sh --rollback <tag>` (no revierte migraciones; ver 6). Exige las tres imágenes del tag y no compila nada |
+| Solo los smoke tests | `sudo ./infra/scripts/deploy.sh --smoke` |
 | Estado / logs | `docker compose ps` · `docker compose logs --tail 100 api` |
-| Verificación completa | `./infra/scripts/preflight.sh` |
-| Backup manual | `./infra/scripts/backup.sh` |
-| Prueba de restauración | `./infra/scripts/restore-test.sh [snapshot]` (mensual y antes de cambios grandes) |
+| Verificación completa | `sudo ./infra/scripts/preflight.sh` |
+| Backup manual | `sudo ./infra/scripts/backup.sh` |
+| Prueba de restauración | `sudo ./infra/scripts/restore-test.sh [snapshot]` (el timer la corre el primer domingo de cada mes) |
+| Escaneo de vulnerabilidades de las imágenes | `sudo ./infra/scripts/scan-images.sh` (ver `docs/VERSIONES.md`) |
 
-**Programar backup y mantenimiento** (ajustá `WorkingDirectory` si el repo está en otra ruta):
+Los smoke tests (al desplegar y en el rollback) verifican `/healthz` y `/api/health`; las cabeceras de seguridad (CSP, `nosniff`, `Referrer-Policy`, `X-Frame-Options`, `Permissions-Policy`, COOP y CORP) en el index, en un asset real del build y en la API; que el asset se sirva como JavaScript con caché inmutable y el index sin caché; que la API sin sesión responda 401 con `no-store`; que un error de la API llegue como JSON y no como el SPA; que no exista el endpoint de datos ficticios; y, fuera del primer despliegue, lo mismo por HTTPS en `PUBLIC_ORIGIN`. No prueban un ingreso con sesión: en el servidor no hay credenciales (hacelo a mano después de cada despliegue).
+
+**Programar las tareas** (el instalador ya lo hace; ajustá `/srv/alvarez-finanzas/app` si el repo está en otra ruta):
 
 ```bash
-sudo cp infra/systemd/alvarez-* /etc/systemd/system/ && sudo systemctl daemon-reload
-sudo systemctl enable --now alvarez-certbot.timer alvarez-backup.timer alvarez-maintenance.timer   # el instalador ya lo hace
+for u in infra/systemd/alvarez-*; do sed "s#/srv/alvarez-finanzas/app#$PWD#g" "$u" | sudo tee "/etc/systemd/system/$(basename "$u")" >/dev/null; done
+sudo systemctl daemon-reload
+sudo systemctl enable --now alvarez-certbot.timer alvarez-backup.timer alvarez-maintenance.timer \
+  alvarez-healthcheck.timer alvarez-restore-test.timer
 systemctl list-timers 'alvarez-*'
 ```
 
-`maintenance.sh` corre todos los días. Purga la auditoría de más de 90 días (con el rol migrador, porque el runtime no puede borrarla) y falla si el disco tiene menos de 2 GiB libres, si algún servicio no está healthy, si no hubo un backup exitoso en las últimas 48 h o si el certificado está por vencer: menos de 48 h en uno de IP, menos de 14 días en uno normal. **Alertas:** una unidad fallida queda en `systemctl --failed` y `journalctl -u alvarez-maintenance`. Para recibir avisos, configurá `OnFailure=` hacia un destino que elijas (correo local, ntfy propio, etc.). Los mensajes no deben llevar contenido financiero. **[no configurado: decisión del propietario]**
+| Timer | Cuándo | Qué hace |
+|---|---|---|
+| `alvarez-backup` | diario 03:17 | `backup.sh`: base + key ring + configuración, copia externa |
+| `alvarez-maintenance` | diario 04:41 | `maintenance.sh` (abajo) |
+| `alvarez-healthcheck` | cada hora | `healthcheck.sh`: db/api/web healthy, `/healthz` y `/api/health` por loopback, disco |
+| `alvarez-restore-test` | primer domingo del mes, 05:23 | `restore-test.sh` (§5) |
+| `alvarez-certbot` | 2 por día | renovación del certificado |
 
-**Logs:** cada contenedor usa el driver `local` con rotación por tamaño (10 MB × 5). Eso limita el espacio, **no la antigüedad**. Para una retención estricta de 30 días, usá `logging.driver: journald` y en `/etc/systemd/journald.conf` poné `MaxRetentionSec=30day`. La API no registra cuerpos, cookies, tokens ni parámetros de consulta; Nginx registra rutas sin query string. Auditoría: tabla `audit_events`, 90 días.
+`maintenance.sh` purga la auditoría de más de 90 días (con el rol migrador, porque el runtime no puede borrarla) y falla si hay menos de 2 GiB libres en el disco del repo, en el de los datos de Docker o en el de `BACKUP_DIR`; si systemd dice que el reloj no está sincronizado por NTP (los códigos TOTP dependen de la hora; `sudo timedatectl set-ntp true`); si algún servicio no está healthy; si no hubo un backup exitoso en las últimas 48 h, ni una copia externa si está configurada; o si el certificado está por vencer: menos de 48 h en uno de IP, menos de 14 días en uno normal. Avisa, sin fallar, si no hay copia externa o si quedó una rotación de restic sin confirmar más de 7 días. `preflight.sh` hace las mismas verificaciones de disco, reloj y copia externa.
+
+**Alertas.** Cada servicio `alvarez-*` tiene `OnFailure=alvarez-alert@%n.service`, que corre `alert.sh`: registra la falla en el journal (`journalctl -t alvarez-alert`) y en `/var/log/alvarez-finanzas/alerts.log`, y **solo si lo configurás en `.env`** avisa a un destino que elijas. El texto es fijo (unidad, servidor y hora): nunca lleva contenido financiero ni extractos de logs. Por defecto no se envía nada fuera del servidor.
+
+- `ALERT_WEBHOOK_URL=https://…`: recibe un POST de texto plano (por ejemplo, un tema de ntfy propio). Si necesita token, poné la cabecera en `SECRETS_DIR/alert-webhook.headers` (p. ej. `Authorization: Bearer …`, modo 400). Solo HTTPS; con una CA propia, `ALERT_WEBHOOK_CA_FILE`.
+- `ALERT_EMAIL=dirección`: usa el `sendmail` local, si hay uno instalado y configurado.
+- `ALERT_REPEAT_HOURS` (6 por defecto): no repite el aviso de la misma unidad antes de ese plazo. El chequeo horario hace que un servicio caído se note en menos de una hora.
+- Probalo con `sudo ./infra/scripts/alert.sh --test`. Probado contra un receptor HTTPS local (`infra/tests/alerts.sh`) **[no probado con un destino real]**.
+
+**Logs.** Cada contenedor usa el driver `local` con rotación por tamaño (10 MB × 5): eso limita el espacio, **no la antigüedad**. Para una retención estricta de 30 días, usá `logging.driver: journald` y en `/etc/systemd/journald.conf` poné `MaxRetentionSec=30day`. El log de Nginx del host (`/var/log/nginx/alvarez-finanzas.*.log`) lo rota el logrotate de la distribución (en Debian/Ubuntu, 14 días). La API no registra cuerpos, cookies, tokens ni parámetros de consulta. Los dos Nginx (el del host y el del contenedor `web`) usan el formato `alvarez_min`: método, ruta **sin query string**, estado, tamaño y duración, sin User-Agent ni Referer, y la IP reducida a /24 (IPv4) o a sus primeros bloques (IPv6). Lo comprueba `infra/tests/nginx-logs.sh`. Límite: el *error log* de Nginx no tiene formato configurable y, ante un error del upstream (API caída), incluye la petición completa y la IP del cliente. El sitio del host se instala aparte: después de actualizar desde una versión anterior, reinstalalo (`sudo CERT_DIR=/etc/alvarez-finanzas/letsencrypt/live/alvarez-finanzas ./infra/scripts/install-nginx-site.sh NOMBRE --force`, con `DEFAULT_443=1 NO_IPV6=1` si es por IP, o volvé a correr el instalador); `preflight.sh` avisa si el sitio instalado es viejo. Auditoría: tabla `audit_events`, 90 días.
 
 ## 4. Backups
 
-- `backup.sh` genera un `pg_dump` consistente (rol migrador) más el key ring, cifrados por restic **antes** de escribir en `BACKUP_DIR`. Retención: últimas 10 + 7 diarios + 4 semanales + 3 mensuales. Al final ejecuta `restic check` sobre una muestra.
-- **Copia fuera de la VPS (obligatoria para considerar el backup completo) [no probado]:** en `.env` definí `OFFSITE_RESTIC_REPOSITORY`, por ejemplo `sftp:usuario@otro-servidor:/backups/alvarez` o `rest:https://…`. Las credenciales del destino van en `SECRETS_DIR/restic-offsite.env` (variables de restic, modo 400). `backup.sh` copia las instantáneas con `restic copy`.
+- `backup.sh` genera un `pg_dump` consistente (rol migrador) más el key ring, cifrados por restic **antes** de escribir en `BACKUP_DIR`. Retención: últimas 10 + 7 diarios + 4 semanales + 3 mensuales. Al final ejecuta `restic check` sobre una muestra. `BACKUP_DIR/backup.log` registra cada backup y el resultado de la copia externa (`offsite=OK|FALLA|no-configurada`).
+- También respalda la **configuración no secreta** con la etiqueta `config`: `.env`, el sitio de Nginx instalado y su snippet, las unidades `alvarez-*` de systemd, `.release-history` y el commit desplegado. Los secretos no van ahí. Para revisarla: `sudo ./infra/scripts/restore-config.sh [snapshot] [DESTINO]` (la extrae en un directorio nuevo; no instala nada).
+- El contenedor de backup corre **sin root** (uid 1654, el dueño del key ring) y sin capacidades efectivas. `backup.sh` deja `BACKUP_DIR` en `root:1654 750`, el repositorio local de `1654` y `restic_password` en `root:1654 440`. Solo la extracción de una restauración (`restore.sh`, `restore-test.sh`, `restore-config.sh`) corre como root dentro del contenedor (`--user 0`): escribe en un directorio temporal del host y conserva dueños y permisos del key ring. Probado: backup, copia externa, rotación, `restore-test.sh`, `restore.sh --with-keyring` y `restore-config.sh`, también con la imagen de backup anterior (después de un rollback).
 - El backup **no** incluye el certificado del key ring: está en tu gestor de contraseñas. No guardes la única clave junto al único backup.
+
+### Copia fuera de la VPS (obligatoria antes de cargar datos reales)
+
+Sin ella, el único backup (y su contraseña) quedan en el mismo servidor que los datos: `preflight.sh` y `maintenance.sh` lo avisan.
+
+1. Elegí un destino privado con un backend **nativo** de restic: S3 o compatible (`s3:https://…`), Backblaze (`b2:`), Azure (`azure:`), Google Cloud Storage (`gs:`), OpenStack (`swift:`) o un rest-server propio (`rest:https://…`). **sftp no está soportado**: la imagen de backup no trae cliente SSH ni se le montan claves.
+2. En `.env`: `OFFSITE_RESTIC_REPOSITORY=s3:https://s3.ejemplo.com/mi-bucket/alvarez` (sin credenciales en la URL).
+3. Las credenciales van en `SECRETS_DIR/restic-offsite.env`, una por línea `NOMBRE=valor` (sin `export`; las comillas que envuelven el valor se quitan):
+
+   ```bash
+   sudo install -m 440 -o root -g 1654 /dev/null /srv/alvarez-finanzas/secrets/restic-offsite.env
+   sudo nano /srv/alvarez-finanzas/secrets/restic-offsite.env
+   #   AWS_ACCESS_KEY_ID=…            (S3)       B2_ACCOUNT_ID=… / B2_ACCOUNT_KEY=…   (b2:)
+   #   AWS_SECRET_ACCESS_KEY=…                   RESTIC_REST_USERNAME=… / RESTIC_REST_PASSWORD=…   (rest:)
+   ```
+
+   El archivo se monta de solo lectura en el contenedor y se lee **sin ejecutarse**. Solo acepta variables de backends (`AWS_*`, `B2_*`, `AZURE_*`, `OS_*`, `ST_*`, `RESTIC_REST_USERNAME`, `RESTIC_REST_PASSWORD`) y de proxy: no puede cambiar el repositorio ni la contraseña de restic.
+4. `sudo ./infra/scripts/backup.sh`. La primera vez crea el repositorio externo con la **misma contraseña de restic** y los mismos parámetros de fragmentación; después copia las instantáneas nuevas (`restic copy`), poda con la misma retención y corre `restic check`. Si la copia falla, el backup local queda hecho, pero `backup.sh` termina con error (→ alerta) y `maintenance.sh` falla si no hubo copia externa en 48 h. Una restauración no espera al destino externo (`BACKUP_LOCAL_ONLY=1`).
+5. `sudo ./infra/scripts/backup.sh --verify-offsite`: descarga el último dump del repositorio externo, comprueba que sea un dump válido (`pg_restore --list`) y que coincida con el local. Hacelo al configurarlo y una vez por mes.
+
+**Destino de solo agregar (recomendado):** con `rest-server --append-only` o un bucket con bloqueo de objetos, poné `OFFSITE_PRUNE=0` en `.env`. Así, un atacante con root en la VPS no puede borrar las copias externas. La poda (`restic forget --prune`) la hacés de vez en cuando desde otra máquina de confianza.
+
+Probado con un rest-server local con usuario y contraseña, a través del archivo de credenciales (`sudo infra/tests/offsite-backup.sh`): creación del repositorio, copia, copia incremental, verificación del dump externo, credenciales incorrectas (el backup local queda, la copia falla y `backup.sh` sale con error) y variables no admitidas. **[no probado con un proveedor real ni con `OFFSITE_PRUNE=0`]**
 
 ## 5. Restauración
 
-**Prueba aislada (no toca producción):** `./infra/scripts/restore-test.sh`. Levanta una base y una API en una red interna sin salida y restaura el dump y el key ring. Verifica conteos, sumas por moneda, consistencia de cuotas, descifrado de los secretos TOTP, que la API arranque y que Data Protection funcione. Revoca las sesiones restauradas y compara con producción. El resultado (fecha, duración, OK/FALLA) queda en `BACKUP_DIR/restore-tests.log`. El script no prueba un ingreso interactivo; hacelo a mano una vez por mes:
+**Prueba aislada (no toca producción):** `sudo ./infra/scripts/restore-test.sh` (también la corre `alvarez-restore-test.timer` el primer domingo de cada mes; si falla, avisa como cualquier otra unidad). Levanta una base y una API en una red interna sin salida y restaura el dump y el key ring. Verifica conteos, sumas por moneda, consistencia de cuotas, descifrado de los secretos TOTP, que la API arranque y que Data Protection funcione. Revoca las sesiones restauradas y compara con producción. El resultado (fecha, duración, OK/FALLA) queda en `BACKUP_DIR/restore-tests.log`. El script no prueba un ingreso interactivo; hacelo a mano una vez por mes:
 
 1. Restaurá en una máquina de prueba con `restore.sh`.
 2. Ingresá con tu contraseña y tu autenticador.
 3. Revisá Resumen y Movimientos.
 
-**Restauración real:** `./infra/scripts/restore.sh <snapshot|latest> [--with-keyring]`.
+**Restauración real:** `sudo ./infra/scripts/restore.sh <snapshot|latest> [--with-keyring]`.
 
 - Pide escribir `RESTAURAR` (y `CLAVES` si restaurás el key ring) y fija el ID de la instantánea **antes** de hacer un backup de seguridad del estado actual (sin poda).
 - Detiene la API y la web, restaura con `pg_restore` dejando las tablas a nombre del rol migrador, re-aplica permisos, revoca todas las sesiones y vuelve a levantar todo.
 - Usá `--with-keyring` solo si se perdió el volumen de claves.
 - Nunca se ejecuta automáticamente.
+- La configuración del servidor (`.env`, sitio de Nginx, unidades) se recupera aparte, a mano, con `restore-config.sh` (§4).
 
 RPO objetivo ≤ 24 h (backup diario). RTO objetivo ≤ 4 h: en el entorno local, restaurar llevó menos de un minuto con pocos datos. Medilo en la VPS.
 
@@ -146,14 +194,23 @@ Las migraciones se aplican una sola vez por despliegue (`migrate`, rol migrador 
 
 ## 7. Rotación de secretos
 
+Acepta varios objetivos en una misma ejecución; los valida todos antes de empezar y reinicia la API una sola vez al final (también si un objetivo posterior falla).
+
 ```bash
-./infra/scripts/rotate-secrets.sh db-app          # nueva contraseña del rol runtime + reinicio de la API (probado)
-./infra/scripts/rotate-secrets.sh db-migrator     # nueva contraseña del rol migrador
-./infra/scripts/rotate-secrets.sh keyring-cert    # certificado nuevo; el anterior queda como previous-*.pfx (probado)
-./infra/scripts/rotate-secrets.sh restic          # agrega una clave nueva al repositorio y quita la anterior [no probado]
+sudo ./infra/scripts/rotate-secrets.sh db-app            # contraseña del rol runtime + reinicio de la API
+sudo ./infra/scripts/rotate-secrets.sh db-migrator       # contraseña del rol migrador (backup y migraciones la leen al correr)
+sudo ./infra/scripts/rotate-secrets.sh keyring-cert      # certificado nuevo; el anterior queda como previous-*.pfx
+sudo ./infra/scripts/rotate-secrets.sh restic            # fase 1: clave nueva en el repositorio local Y en el externo
+sudo ./infra/scripts/rotate-secrets.sh restic-confirm    # fase 2, después de guardar la nueva fuera del servidor
+sudo ./infra/scripts/rotate-secrets.sh db-app db-migrator keyring-cert restic   # todo junto (incidente)
 ```
 
-No borres `previous-*.pfx` mientras existan claves o backups que lo necesiten (se recomienda al menos un año). Actualizá tu gestor de contraseñas después de cada rotación.
+- **Base de datos:** la contraseña nueva se escribe en el archivo de secretos (mismo inodo) y `psql` la lee de ese archivo montado: no aparece en argumentos ni se arma SQL con ella. Si `ALTER ROLE` falla, se restituye la anterior.
+- **restic, sin perder nunca el acceso:** la fase 1 comprueba que cada repositorio (local y, si está configurado, el externo) abra con la contraseña vigente; agrega la clave nueva a todos (si uno falla, deshace lo hecho y no cambia nada); verifica que la nueva abra todos; recién entonces la deja como vigente y guarda la anterior en `restic_password.previous`, que sigue abriendo los backups. Guardá la nueva en tu gestor de contraseñas y corré `restic-confirm`: pide escribir `GUARDADA` y quita la clave anterior de ambos repositorios. `preflight.sh` avisa mientras haya una rotación sin confirmar, y `maintenance.sh` a los 7 días.
+- Cambiar la contraseña de restic **no** cambia la clave maestra del repositorio: si alguien pudo copiar el repositorio **y** la contraseña, esos backups siguen expuestos. En ese caso, empezá repositorios nuevos (mové `BACKUP_DIR/restic` y usá otra ruta externa) después de rotar.
+- No borres `previous-*.pfx` mientras existan claves o backups que lo necesiten (se recomienda al menos un año). Actualizá tu gestor de contraseñas después de cada rotación.
+
+Probadas en el entorno de prueba: cada objetivo por separado y los cuatro juntos, con la API healthy después, backup con la contraseña nueva del migrador y `restore-test.sh` con el certificado rotado; la rotación de restic en sus dos fases contra el repositorio local y uno externo (rest-server), comprobando que la anterior abre todo hasta confirmar y nada después.
 
 ## 8. Recuperación de acceso
 
@@ -162,10 +219,33 @@ No borres `previous-*.pfx` mientras existan claves o backups que lo necesiten (s
 
 ## 9. Incidente (sospecha de acceso indebido)
 
-1. **Restringir:** `docker compose stop web`, o bloquear el sitio en Nginx.
-2. **Preservar:** copiá `docker compose logs api web` y los logs de Nginx. Exportá `audit_events` (`docker compose exec db psql -U alvarez_admin -d alvarez -c "\copy audit_events to '/tmp/audit.csv' csv header"`).
+Desde el directorio de la app (`cd /srv/alvarez-finanzas/app`), como root:
+
+1. **Restringir:** `docker compose stop web`, o bloquear el sitio en Nginx. (El chequeo horario va a avisar que `web` está caído: es esperable.)
+2. **Preservar** (en un directorio solo de root; después copialo fuera del servidor):
+
+   ```bash
+   dir=/root/incidente-$(date -u +%Y%m%dT%H%M%SZ); install -d -m 700 "$dir"
+   docker compose logs --no-color --timestamps api web db > "$dir/contenedores.log"
+   cp -p /var/log/nginx/alvarez-finanzas.* /var/log/alvarez-finanzas/alerts.log "$dir/" 2>/dev/null
+   journalctl --since "-14 days" -u ssh -u 'alvarez-*' > "$dir/journal.log"
+   docker compose exec -T db psql -U alvarez_admin -d alvarez -c "\copy audit_events to stdout with csv header" > "$dir/audit_events.csv"
+   ```
+
+   `\copy … to stdout` escribe en la salida de `psql`, que queda directamente en el archivo del host (nada en `/tmp` del contenedor).
 3. **Revocar sesiones:** `docker compose exec api dotnet AlvarezFinanzas.Api.dll revoke-sessions`.
-4. **Rotar:** contraseña del propietario (`recover-owner.sh`), `rotate-secrets.sh db-app db-migrator keyring-cert restic` y las claves SSH de la VPS.
+4. **Rotar:** contraseña del propietario (`recover-owner.sh`); `sudo ./infra/scripts/rotate-secrets.sh db-app db-migrator keyring-cert restic` y, después de guardar la contraseña nueva de restic fuera del servidor, `sudo ./infra/scripts/rotate-secrets.sh restic-confirm` (§7; si el repositorio pudo copiarse, empezá uno nuevo); las credenciales del destino externo y del aviso de alertas en sus proveedores (y en `SECRETS_DIR`); y las claves SSH de la VPS.
 5. **Evaluar exposición:** revisá la auditoría (logins, exportaciones, importaciones) y los accesos SSH (`journalctl -u ssh`). Un root comprometido puede haber leído memoria, secretos y datos.
 6. **Recuperar** desde una copia conocida y buena (`restore.sh`), en una VPS limpia si hubo compromiso del host.
 7. **Revisar la causa** y documentarla.
+
+## 10. Pruebas de los scripts de operación
+
+| Prueba | Qué comprueba | Dónde corre |
+|---|---|---|
+| `infra/tests/nginx-logs.sh [IMAGEN_WEB]` | Los dos Nginx registran sin query string, sin User-Agent y con la IP reducida | CI y local (contenedores sin red) |
+| `infra/tests/alerts.sh` | `alert.sh`: solo registra sin destino; con destino envía el texto fijo y el token; no repite; rechaza `http://` | CI y local |
+| `infra/scripts/scan-images.sh [TAG]` | Trivy: sin HIGH/CRITICAL corregibles fuera de `infra/trivy-ignore.yaml` | CI (cada push y semanal) y local |
+| `sudo infra/tests/offsite-backup.sh [--rotate-restic]` | Copia externa con credenciales contra un rest-server local; con `--rotate-restic`, la rotación completa | Sobre una instalación de prueba (rota secretos reales: no usar en producción con `--rotate-restic`) |
+
+En CI también corren `shellcheck` (fijado por digest) sobre todos los scripts y `systemd-analyze verify` sobre las unidades.

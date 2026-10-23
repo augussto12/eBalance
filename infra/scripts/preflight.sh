@@ -44,6 +44,12 @@ if offsite_configured; then
 else
   note "sin copia de backups fuera de la VPS (OFFSITE_RESTIC_REPOSITORY): el único backup está en este servidor (RUNBOOK §4)"
 fi
+# Sitio del Nginx del host: se instala aparte (install-nginx-site.sh), así que un deploy no lo actualiza.
+for site in /etc/nginx/sites-available/zz-alvarez-finanzas.conf /etc/nginx/conf.d/zz-alvarez-finanzas.conf; do
+  if [[ -f "$site" ]] && ! grep -q 'alvarez_ip_min' "$site"; then
+    note "$site es de una versión anterior (registra la IP completa): reinstalalo con install-nginx-site.sh NOMBRE --force (RUNBOOK §3)"
+  fi
+done
 [[ ! -e "$SECRETS_DIR/restic_password.previous" ]] \
   || note "rotación de restic sin confirmar: guardá la contraseña nueva fuera del servidor y corré rotate-secrets.sh restic-confirm"
 

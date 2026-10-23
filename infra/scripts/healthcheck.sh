@@ -6,6 +6,7 @@ source "$(dirname "$0")/lib.sh"
 load_env
 status=0
 fail() { warn "$*"; status=1; }
+# shellcheck disable=SC2329  # la llama check_disks
 note() { echo "$*"; }
 for svc in db api web; do
   state="$(docker inspect -f '{{.State.Health.Status}}' "$(dc ps -q "$svc" 2>/dev/null)" 2>/dev/null || true)"

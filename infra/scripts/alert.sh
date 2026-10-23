@@ -11,7 +11,7 @@
 #   ./infra/scripts/alert.sh alvarez-backup.service     (lo llama systemd)
 #   sudo ./infra/scripts/alert.sh --test                envía un aviso de prueba al destino configurado
 source "$(dirname "$0")/lib.sh"
-if [[ -f .env ]]; then load_env; else warn "Falta .env: solo se registra el aviso."; SECRETS_DIR="${SECRETS_DIR:-./secrets}"; fi
+if [[ -f .env ]]; then load_env; else warn "Falta .env: se usan solo las variables de entorno."; SECRETS_DIR="${SECRETS_DIR:-./secrets}"; fi
 unit="${1:?Uso: alert.sh UNIDAD | --test}"
 log_dir="${ALERT_LOG_DIR:-/var/log/alvarez-finanzas}"
 state_dir="${ALERT_STATE_DIR:-/var/lib/alvarez-finanzas/alerts}"
@@ -48,7 +48,7 @@ if [[ -n "${ALERT_WEBHOOK_URL:-}" ]]; then
     warn "ALERT_WEBHOOK_URL debe ser https://: no se envió."; failed=1
   else
     args=(-fsS --max-time 20 --proto "=https" --proto-redir "=https" -o /dev/null -H "Content-Type: text/plain; charset=utf-8")
-    headers="$SECRETS_DIR/alert-webhook.headers"
+    headers="${ALERT_WEBHOOK_HEADERS_FILE:-$SECRETS_DIR/alert-webhook.headers}"
     [[ -f "$headers" ]] && args+=(-H "@$headers")
     [[ -n "${ALERT_WEBHOOK_CA_FILE:-}" ]] && args+=(--cacert "$ALERT_WEBHOOK_CA_FILE")
     if curl "${args[@]}" --data-binary "$msg" "$ALERT_WEBHOOK_URL"; then sent=1; else warn "No se pudo enviar el aviso al webhook."; failed=1; fi

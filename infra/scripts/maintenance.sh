@@ -8,6 +8,7 @@ source "$(dirname "$0")/lib.sh"
 load_env
 status=0
 fail() { warn "$*"; status=1; }
+# shellcheck disable=SC2329  # la llama check_disks
 note() { echo "$*"; }
 dc --profile ops run --rm -T migrate purge-audit </dev/null || status=1
 check_disks note fail || true

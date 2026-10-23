@@ -69,6 +69,8 @@ jobs:
           docker run --rm -v "$PWD:/mnt:ro" -w /mnt \
             koalaman/shellcheck:v0.11.0@sha256:61862eba1fcf09a484ebcc6feea46f1782532571a34ed51fedf90dd25f925a8d \
             -x -P infra/scripts -S warning infra/scripts/*.sh infra/tests/*.sh infra/docker/*.sh infra/docker/postgres/*.sh infra/e2e/*.sh
+      - name: Avisos de falla (alert.sh contra un receptor HTTPS local)
+        run: infra/tests/alerts.sh
       - name: Unidades systemd válidas
         run: |
           mkdir -p "$RUNNER_TEMP/units"

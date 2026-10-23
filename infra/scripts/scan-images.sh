@@ -21,12 +21,14 @@ if [[ -n "${HTTPS_PROXY:-}" ]]; then run+=(--network host -e "HTTPS_PROXY=$HTTPS
 if [[ -n "${EXTRA_CA_FILE:-}" ]]; then run+=(-v "$(realpath "$EXTRA_CA_FILE"):/extra-ca.pem:ro" -e SSL_CERT_FILE=/extra-ca.pem); fi
 common=(--scanners vuln --severity "HIGH,CRITICAL" --ignore-unfixed --ignorefile /ignore.yaml --no-progress)
 
-scan() { # imagen archivo exit-code
-  docker save -o "$work/$2.tar" "$1"
+scan() { # imagen archivo exit-code → devuelve el código de Trivy
+  local rc=0
+  docker save -o "$work/$2.tar" "$1" || return 2
   chmod 644 "$work/$2.tar"
   echo "==> $1"
-  "${run[@]}" "$TRIVY_IMAGE" image --input "/work/$2.tar" "${common[@]}" --exit-code "$3"
+  "${run[@]}" "$TRIVY_IMAGE" image --input "/work/$2.tar" "${common[@]}" --exit-code "$3" || rc=$?
   rm -f "$work/$2.tar"
+  return "$rc"
 }
 
 rc=0

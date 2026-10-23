@@ -49,7 +49,7 @@ ok "credenciales incorrectas: backup local OK, copia externa FALLA y backup.sh s
 printf 'RESTIC_REST_USERNAME=%s\r\nRESTIC_REST_PASSWORD="%s"\r\n' "$user" "$pass" > "$OFFSITE_RESTIC_ENV_FILE"
 "$ROOT/infra/scripts/backup.sh" </dev/null
 [[ "$(last_log)" == *"backup OK offsite=OK" ]] || fail "backup.log: $(last_log)"
-backup_ops offsite-verify
+"$ROOT/infra/scripts/backup.sh" --verify-offsite </dev/null
 backup_ops snapshots offsite > "$tmp/snaps"
 for t in db keyring config; do grep -qw "$t" "$tmp/snaps" || fail "falta una instantánea «$t» en el repositorio externo"; done
 ok "copia externa con credenciales: db, keyring y config; el último dump externo es válido e igual al local"

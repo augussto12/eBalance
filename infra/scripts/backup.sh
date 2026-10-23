@@ -4,11 +4,17 @@
 # está en .env (credenciales en SECRETS_DIR/restic-offsite.env). Programado a diario por alvarez-backup.timer.
 #   BACKUP_NO_PRUNE=1    no borra instantáneas locales (backup de seguridad antes de restaurar)
 #   BACKUP_LOCAL_ONLY=1  no copia al repositorio externo (lo usa restore.sh: una caída del destino no frena la restauración)
+#   backup.sh --verify-offsite   solo verifica que el último dump del repositorio externo se lea y sea igual al local
 # Correr como root (sudo): ajusta los permisos que necesita el contenedor de backup, que corre sin root.
 source "$(dirname "$0")/lib.sh"
 load_env
 umask 077
 prepare_backup_perms
+if [[ "${1:-}" == --verify-offsite ]]; then
+  offsite_configured || die "No hay repositorio externo configurado (OFFSITE_RESTIC_REPOSITORY en .env)."
+  backup_ops offsite-verify
+  exit 0
+fi
 dc --profile ops run --rm -T backup init </dev/null
 dc --profile ops run --rm -T -e BACKUP_NO_PRUNE="${BACKUP_NO_PRUNE:-0}" backup backup </dev/null
 
