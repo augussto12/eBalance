@@ -105,7 +105,7 @@ if (( rotate )); then
   done
   ok "fase 1: la nueva y la anterior abren el repositorio local y el externo"
   "$ROOT/infra/scripts/backup.sh" </dev/null >/dev/null
-  [[ "$(last_log)" == *"offsite=OK" ]] || fail "backup con la contraseña nueva: $(last_log)"
+  [[ "$(last_log)" == *" offsite=OK "* ]] || fail "backup con la contraseña nueva: $(last_log)"
   ok "backup y copia externa con la contraseña nueva"
   printf 'GUARDADA\n' | "$ROOT/infra/scripts/rotate-secrets.sh" restic-confirm
   [[ ! -e "$SECRETS_DIR/restic_password.previous" ]] || fail "restic_password.previous sigue después de confirmar"
