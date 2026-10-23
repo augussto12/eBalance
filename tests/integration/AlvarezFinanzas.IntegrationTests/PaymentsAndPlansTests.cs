@@ -516,5 +516,25 @@ public class PaymentsAndPlansTests(PostgresFixture pg)
         }, Key("pago-excede-expl-1"));
         Assert.Equal(HttpStatusCode.UnprocessableEntity, auto.StatusCode);
         Assert.Equal(HttpStatusCode.UnprocessableEntity, explicitAllocation.StatusCode);
+
+        // Referencia inexistente o de otra moneda: 400 por campo, igual para cuentas, planes, cuotas y gastos.
+        var usd = await a.AccountAsync("Caja USD", "cash", "USD");
+        var missingPlan = await a.PostAsync("/api/v1/payments", new { sourceAccountId = bank, planId = Guid.NewGuid(), date = "2027-01-05", currency = "ARS", amountMinor = "1" }, Key("pago-ref-plan-01"));
+        var missingInstallment = await a.PostAsync("/api/v1/payments", new
+        {
+            sourceAccountId = bank, date = "2027-01-05", currency = "ARS", amountMinor = "1",
+            allocations = new[] { new { installmentId = Guid.NewGuid(), amountMinor = "1" } },
+        }, Key("pago-ref-cuota-01"));
+        var otherCurrencyInstallment = await a.PostAsync("/api/v1/payments", new
+        {
+            sourceAccountId = usd, date = "2027-01-05", currency = "USD", amountMinor = "1",
+            allocations = new[] { new { installmentId = Guid.Parse(Installments(p)[0].Str("id")), amountMinor = "1" } },
+        }, Key("pago-ref-moneda-01"));
+        var otherCurrencySource = await a.PostAsync("/api/v1/payments", new { sourceAccountId = usd, targetAccountId = visa, date = "2027-01-05", currency = "ARS", amountMinor = "1" }, Key("pago-ref-origen-01"));
+        Assert.Equal(HttpStatusCode.BadRequest, missingPlan.StatusCode);
+        Assert.Equal(HttpStatusCode.BadRequest, missingInstallment.StatusCode);
+        Assert.Equal(HttpStatusCode.BadRequest, otherCurrencyInstallment.StatusCode);
+        Assert.Equal(HttpStatusCode.BadRequest, otherCurrencySource.StatusCode);
+        Assert.True((await missingInstallment.Json()).GetProperty("errors").TryGetProperty("allocations", out _));
     }
 }

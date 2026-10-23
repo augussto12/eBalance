@@ -236,8 +236,9 @@ public static class CashEndpoints
                 {
                     var inst = await db.Installments.Include(i => i.Plan)
                         .SingleOrDefaultAsync(i => i.Id == id && i.OwnerId == owner && i.Plan!.DeletedAt == null, ct);
-                    if (inst is null) return Problems.Unprocessable("Alguna cuota no existe.");
-                    if (inst.Plan!.Currency != currency) return Problems.Unprocessable("Alguna cuota es de otra moneda.");
+                    // Referencias como las de sourceAccountId/planId: inexistente, ajena o incompatible → 400 por campo.
+                    if (inst is null) { v.Add("allocations", "Alguna cuota no existe."); return v.Problem(); }
+                    if (inst.Plan!.Currency != currency) { v.Add("allocations", "Alguna cuota es de otra moneda."); return v.Problem(); }
                     if (amt > inst.PendingMinor) return Problems.Unprocessable("Una asignación supera lo pendiente de la cuota.");
                     inst.PaidMinor = checked(inst.PaidMinor + amt);
                     payment.Allocations.Add(new PaymentAllocation { OwnerId = owner, PaymentId = payment.Id, InstallmentId = id, Installment = inst, AmountMinor = amt });
@@ -247,8 +248,11 @@ public static class CashEndpoints
                     var entry = await db.Entries.Include(e => e.Account)
                         .SingleOrDefaultAsync(e => e.Id == id && e.OwnerId == owner && e.DeletedAt == null, ct);
                     if (entry is null || entry.Kind != EntryKind.Expense || entry.Account?.Kind != AccountKind.CreditCard)
-                        return Problems.Unprocessable("Algún gasto no existe o no está cargado a una tarjeta.");
-                    if (entry.Currency != currency) return Problems.Unprocessable("Algún gasto es de otra moneda.");
+                    {
+                        v.Add("allocations", "Algún gasto no existe o no está cargado a una tarjeta.");
+                        return v.Problem();
+                    }
+                    if (entry.Currency != currency) { v.Add("allocations", "Algún gasto es de otra moneda."); return v.Problem(); }
                     if (amt > entry.AmountMinor - entry.PaidMinor) return Problems.Unprocessable("Una asignación supera lo pendiente del gasto.");
                     entry.PaidMinor = checked(entry.PaidMinor + amt);
                     payment.Allocations.Add(new PaymentAllocation { OwnerId = owner, PaymentId = payment.Id, EntryId = id, Entry = entry, AmountMinor = amt });

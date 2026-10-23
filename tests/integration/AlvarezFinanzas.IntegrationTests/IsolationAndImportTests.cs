@@ -34,7 +34,8 @@ public class IsolationTests(PostgresFixture pg)
         var accB = await b.AccountAsync("Banco B");
         var pay = await b.PostAsync("/api/v1/payments", new { sourceAccountId = accB, date = "2026-10-06", currency = "ARS", amountMinor = "20000",
             allocations = new[] { new { installmentId = Guid.Parse(instA), amountMinor = "20000" } } }, new Dictionary<string, string> { ["Idempotency-Key"] = "ataque-0001" });
-        Assert.Equal(HttpStatusCode.UnprocessableEntity, pay.StatusCode);
+        // Igual que una cuenta ajena: «no existe» por campo (400), sin confirmar que la cuota es de otro usuario.
+        Assert.Equal(HttpStatusCode.BadRequest, pay.StatusCode);
         var tr = await b.PostAsync("/api/v1/transfers", new { fromAccountId = accB, toAccountId = accA, currency = "ARS", amountMinor = "100", date = "2026-10-06" });
         Assert.Equal(HttpStatusCode.BadRequest, tr.StatusCode);
         // Listas y agregaciones.
