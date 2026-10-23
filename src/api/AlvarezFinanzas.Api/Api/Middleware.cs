@@ -13,7 +13,12 @@ public static class Middleware
     public static IApplicationBuilder UseCorrelationId(this IApplicationBuilder app) => app.Use(async (ctx, next) =>
     {
         ctx.TraceIdentifier = Activity.Current?.TraceId.ToString() ?? Guid.NewGuid().ToString("N");
-        ctx.Response.Headers["X-Correlation-Id"] = ctx.TraceIdentifier;
+        // Al empezar la respuesta: el manejador de excepciones limpia los headers antes de escribir el 500.
+        ctx.Response.OnStarting(() =>
+        {
+            ctx.Response.Headers["X-Correlation-Id"] = ctx.TraceIdentifier;
+            return Task.CompletedTask;
+        });
         await next();
     });
 
@@ -105,8 +110,10 @@ public sealed class MaintenanceService(IServiceScopeFactory scopes, TimeProvider
                 await using var scope = scopes.CreateAsyncScope();
                 var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
                 var now = clock.GetUtcNow();
+                // Proceso de mantenimiento sobre todos los propietarios: sin sesión, el filtro global por owner se ignora explícitamente.
                 await Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ExecuteUpdateAsync(
-                    db.ImportBatches.Where(b => b.Status == Domain.ImportStatus.Preview && b.ExpiresAt < now),
+                    Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.IgnoreQueryFilters(db.ImportBatches, [AppDbContext.OwnerFilter])
+                        .Where(b => b.Status == Domain.ImportStatus.Preview && b.ExpiresAt < now),
                     s => s.SetProperty(b => b.Status, Domain.ImportStatus.Expired).SetProperty(b => b.NormalizedPayload, (string?)null), stoppingToken);
                 var cutoff = now.AddDays(-30);
                 await Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ExecuteDeleteAsync(

@@ -3,7 +3,6 @@ using System.Text.RegularExpressions;
 using AlvarezFinanzas.Api;
 using AlvarezFinanzas.Domain;
 using AlvarezFinanzas.Infrastructure.Auth;
-using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
@@ -16,7 +15,8 @@ namespace AlvarezFinanzas.Infrastructure;
 /// </summary>
 public static partial class Cli
 {
-    private static readonly string[] Commands = ["migrate", "bootstrap-owner", "recover-owner", "revoke-sessions", "purge-audit", "check-config", "verify-data"];
+    private static readonly string[] Commands = ["migrate", "bootstrap-owner", "recover-owner", "revoke-sessions", "purge-audit", "check-config", "verify-data", "reset-key-ring"];
+    public const string ResetKeyRingConfirmation = "ACEPTAR-PERDIDA";
     public static readonly string[] DefaultCategories = ["Otros", "Alimentación", "Hogar", "Servicios", "Tecnología", "Transporte", "Ocio", "Trabajo", "Salud"];
 
     public static bool IsCommand(string arg) => Commands.Contains(arg);
@@ -131,6 +131,8 @@ public static partial class Cli
                 return await CheckConfigAsync(sp, db);
             case "verify-data":
                 return await VerifyDataAsync(sp, db, args.Contains("--revoke-sessions"));
+            case "reset-key-ring":
+                return await ResetKeyRingAsync(sp, db, users);
             default:
                 return 2;
         }
@@ -214,22 +216,25 @@ public static partial class Cli
         {
             Check(false, "Historial de migraciones legible: " + ex.SqlState);
         }
+        // Nada de lo que sigue protege datos ni crea claves: un Protect() aquí generaría una clave en un key ring vacío y
+        // ocultaría su pérdida. Las claves se cuentan antes de tocar Data Protection y se verifica con el key ring de solo lectura.
         var keyDir = new DirectoryInfo(options.KeyRingPath);
         Check(keyDir.Exists, "Directorio del key ring presente");
+        var keyFiles = keyDir.Exists ? keyDir.GetFiles("key-*.xml") : [];
+        Check(keyFiles.Length > 0, "Key ring con claves");
+        if (keyFiles.Length > 0)
+        {
+            var plain = keyFiles.Any(f => !File.ReadAllText(f.FullName).Contains("encryptedSecret", StringComparison.Ordinal));
+            Check(!plain, "Claves del key ring cifradas con certificado");
+        }
         try
         {
-            var p = sp.GetRequiredService<IDataProtectionProvider>().CreateProtector("check-config");
-            Check(p.Unprotect(p.Protect("ok")) == "ok", "Data Protection: proteger/desproteger");
+            var report = await sp.GetRequiredService<KeyRingGuard>().VerifyAsync(db);
+            Check(report.Status == KeyRingStatus.Verified, "Data Protection: " + report.Detail);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             Check(false, "Data Protection: " + ex.GetType().Name);
-        }
-        Check(keyDir.Exists && keyDir.GetFiles("key-*.xml").Length > 0, "Key ring con claves");
-        if (keyDir.Exists)
-        {
-            var plain = keyDir.GetFiles("key-*.xml").Any(f => !File.ReadAllText(f.FullName).Contains("encryptedSecret", StringComparison.Ordinal));
-            Check(!plain, "Claves del key ring cifradas con certificado");
         }
         Check(await db.Users.CountAsync() <= 1, "Un único propietario");
         var owner = await db.Users.OrderBy(u => u.CreatedAt).FirstOrDefaultAsync();
@@ -238,27 +243,29 @@ public static partial class Cli
     }
 
     /// <summary>
-    /// Verificación de restauración: conteos, sumas por moneda (enteros exactos), integridad de cuotas y que los secretos
-    /// TOTP se puedan descifrar con el key ring restaurado. Opcionalmente revoca todas las sesiones restauradas.
+    /// Procesos operativos que recorren TODOS los propietarios (sin sesión): ignoran explícitamente el filtro global por owner.
+    /// </summary>
+    private static IQueryable<T> AllOwners<T>(DbSet<T> set) where T : class => set.IgnoreQueryFilters([AppDbContext.OwnerFilter]);
+
+    /// <summary>
+    /// Verificación de restauración: conteos, sumas por moneda (enteros exactos), integridad de cuotas y que el centinela y
+    /// los secretos TOTP se puedan descifrar con el key ring restaurado (de solo lectura: no crea claves). Opcionalmente
+    /// revoca todas las sesiones restauradas.
     /// </summary>
     private static async Task<int> VerifyDataAsync(IServiceProvider sp, AppDbContext db, bool revokeSessions)
     {
-        var totp = sp.GetRequiredService<TotpService>();
-        var secrets = await db.Users.Where(u => u.TotpSecretProtected != null).Select(u => u.TotpSecretProtected!).ToListAsync();
-        var decryptable = 0;
-        foreach (var s in secrets)
-        {
-            try { _ = totp.Unprotect(s); decryptable++; } catch (System.Security.Cryptography.CryptographicException) { }
-        }
-        var sums = await db.Entries.Where(e => e.DeletedAt == null)
+        var keyRing = await sp.GetRequiredService<KeyRingGuard>().VerifyAsync(db);
+        var secrets = keyRing.TotpSecrets;
+        var decryptable = keyRing.TotpDecryptable;
+        var sums = await AllOwners(db.Entries).Where(e => e.DeletedAt == null)
             .GroupBy(e => new { e.Currency, e.Kind })
             .Select(g => new { currency = g.Key.Currency.ToString(), kind = g.Key.Kind.ToString(), count = g.Count(), totalMinor = g.Sum(x => x.AmountMinor) })
             .ToListAsync();
-        var planSums = await db.Plans.Where(p => p.DeletedAt == null)
+        var planSums = await AllOwners(db.Plans).Where(p => p.DeletedAt == null)
             .GroupBy(p => p.Currency)
             .Select(g => new { currency = g.Key.ToString(), count = g.Count(), totalMinor = g.Sum(x => x.TotalMinor) })
             .ToListAsync();
-        var badPlans = await db.Plans.CountAsync(p => p.TotalMinor != p.Installments.Sum(i => i.AmountMinor) || p.Count != p.Installments.Count());
+        var badPlans = await AllOwners(db.Plans).CountAsync(p => p.TotalMinor != p.Installments.Sum(i => i.AmountMinor) || p.Count != p.Installments.Count());
         var revoked = 0;
         if (revokeSessions)
         {
@@ -271,24 +278,75 @@ public static partial class Cli
             counts = new
             {
                 users = await db.Users.CountAsync(),
-                accounts = await db.Accounts.CountAsync(),
-                categories = await db.Categories.CountAsync(),
-                entries = await db.Entries.CountAsync(),
-                plans = await db.Plans.CountAsync(),
-                installments = await db.Installments.CountAsync(),
-                payments = await db.Payments.CountAsync(),
-                transfers = await db.Transfers.CountAsync(),
+                accounts = await AllOwners(db.Accounts).CountAsync(),
+                categories = await AllOwners(db.Categories).CountAsync(),
+                entries = await AllOwners(db.Entries).CountAsync(),
+                plans = await AllOwners(db.Plans).CountAsync(),
+                installments = await AllOwners(db.Installments).CountAsync(),
+                payments = await AllOwners(db.Payments).CountAsync(),
+                transfers = await AllOwners(db.Transfers).CountAsync(),
                 auditEvents = await db.AuditEvents.CountAsync(),
             },
             entrySums = sums,
             planSums,
             plansWithInconsistentInstallments = badPlans,
-            totpSecrets = secrets.Count,
+            totpSecrets = secrets,
             totpDecryptable = decryptable,
+            // Verified / Missing (backup anterior al centinela) / Mismatch (el key ring no corresponde a este dump).
+            keyRingSentinel = keyRing.Status.ToString(),
             sessionsRevoked = revoked,
         };
         Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(report, new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
-        return badPlans == 0 && decryptable == secrets.Count ? 0 : 1;
+        return badPlans == 0 && decryptable == secrets && keyRing.Status != KeyRingStatus.Mismatch ? 0 : 1;
+    }
+
+    /// <summary>
+    /// Aceptación explícita y auditada de un key ring perdido sin copia (la API se niega a arrancar). Reinicia el segundo
+    /// factor de los usuarios cuyo secreto ya no se puede descifrar, revoca todas las sesiones y registra un centinela nuevo
+    /// con las claves actuales. No toca datos financieros. Si el key ring se puede restaurar, restaurarlo en su lugar.
+    /// </summary>
+    private static async Task<int> ResetKeyRingAsync(IServiceProvider sp, AppDbContext db, UserManager<AppUser> users)
+    {
+        var guard = sp.GetRequiredService<KeyRingGuard>();
+        var report = await guard.VerifyAsync(db);
+        if (report.Status != KeyRingStatus.Mismatch)
+        {
+            Console.WriteLine($"No hay nada que reiniciar: {report.Detail}.");
+            return 0;
+        }
+        Console.WriteLine($"El key ring no corresponde a esta base: {report.Detail}.");
+        var confirm = Prompt("Esto acepta la pérdida del key ring: reinicia el segundo factor de los usuarios cuyo secreto no se puede " +
+                             "descifrar, revoca todas las sesiones y registra un centinela nuevo con las claves actuales. Si tenés una copia " +
+                             $"del key ring, cancelá y restaurala (restore.sh --with-keyring). Escribí {ResetKeyRingConfirmation} para confirmar: ");
+        if (confirm != ResetKeyRingConfirmation) { Console.Error.WriteLine("Cancelado."); return 5; }
+
+        var reset = 0;
+        foreach (var user in await db.Users.Where(u => u.TotpSecretProtected != null || u.TotpPendingSecretProtected != null).ToListAsync())
+        {
+            user.TotpPendingSecretProtected = null;
+            user.TotpPendingCreatedAt = null;
+            if (user.TotpSecretProtected is not null && !guard.CanDecryptTotp(user.TotpSecretProtected))
+            {
+                user.TotpSecretProtected = null;
+                user.TotpLastTimeStep = null;
+                user.TwoFactorEnabled = false;
+                await db.RecoveryCodes.Where(r => r.UserId == user.Id).ExecuteDeleteAsync();
+                reset++;
+            }
+            user.ProfileVersion++;
+            await users.UpdateAsync(user);
+            await users.UpdateSecurityStampAsync(user);
+        }
+        var revoked = await db.Sessions.Where(s => s.RevokedAt == null).ExecuteUpdateAsync(u => u
+            .SetProperty(x => x.RevokedAt, DateTimeOffset.UtcNow).SetProperty(x => x.RevokedReason, "key_ring_reset")
+            .SetProperty(x => x.ProtectedTicket, (byte[]?)null));
+        await db.KeyRingSentinels.ExecuteDeleteAsync();
+        await guard.CreateAsync(db, "reset");
+        db.AuditEvents.Add(new AuditEvent { Action = "cli.reset_key_ring", Result = "success", OccurredAt = DateTimeOffset.UtcNow });
+        await db.SaveChangesAsync();
+        Console.WriteLine($"Key ring aceptado. Segundos factores reiniciados: {reset}. Sesiones revocadas: {revoked}. " +
+                          "Al iniciar sesión se pedirá configurar el segundo factor de nuevo.");
+        return 0;
     }
 
     private static string Prompt(string label)

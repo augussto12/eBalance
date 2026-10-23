@@ -583,6 +583,12 @@ namespace AlvarezFinanzas.Infrastructure.Migrations
                         .HasColumnType("bigint")
                         .HasColumnName("amount_minor");
 
+                    b.Property<DateTimeOffset>("CreatedAt")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("created_at")
+                        .HasDefaultValueSql("now()");
+
                     b.Property<bool>("DeclaredPaid")
                         .HasColumnType("boolean")
                         .HasColumnName("declared_paid");
@@ -606,6 +612,12 @@ namespace AlvarezFinanzas.Infrastructure.Migrations
                     b.Property<Guid>("PlanId")
                         .HasColumnType("uuid")
                         .HasColumnName("plan_id");
+
+                    b.Property<DateTimeOffset>("UpdatedAt")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("updated_at")
+                        .HasDefaultValueSql("now()");
 
                     b.Property<long>("Version")
                         .IsConcurrencyToken()
@@ -764,6 +776,31 @@ namespace AlvarezFinanzas.Infrastructure.Migrations
                         });
                 });
 
+            modelBuilder.Entity("AlvarezFinanzas.Domain.KeyRingSentinel", b =>
+                {
+                    b.Property<int>("Id")
+                        .HasColumnType("integer")
+                        .HasColumnName("id");
+
+                    b.Property<DateTimeOffset>("CreatedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("created_at");
+
+                    b.Property<string>("ProtectedValue")
+                        .IsRequired()
+                        .HasMaxLength(1000)
+                        .HasColumnType("character varying(1000)")
+                        .HasColumnName("protected_value");
+
+                    b.HasKey("Id")
+                        .HasName("pk_key_ring_sentinel");
+
+                    b.ToTable("key_ring_sentinel", null, t =>
+                        {
+                            t.HasCheckConstraint("ck_key_ring_sentinel_single", "id = 1");
+                        });
+                });
+
             modelBuilder.Entity("AlvarezFinanzas.Domain.Payment", b =>
                 {
                     b.Property<Guid>("Id")
@@ -859,6 +896,12 @@ namespace AlvarezFinanzas.Infrastructure.Migrations
                         .HasColumnType("bigint")
                         .HasColumnName("amount_minor");
 
+                    b.Property<DateTimeOffset>("CreatedAt")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("created_at")
+                        .HasDefaultValueSql("now()");
+
                     b.Property<Guid?>("EntryId")
                         .HasColumnType("uuid")
                         .HasColumnName("entry_id");
@@ -874,6 +917,19 @@ namespace AlvarezFinanzas.Infrastructure.Migrations
                     b.Property<Guid>("PaymentId")
                         .HasColumnType("uuid")
                         .HasColumnName("payment_id");
+
+                    b.Property<DateTimeOffset>("UpdatedAt")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("updated_at")
+                        .HasDefaultValueSql("now()");
+
+                    b.Property<long>("Version")
+                        .IsConcurrencyToken()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint")
+                        .HasDefaultValue(1L)
+                        .HasColumnName("version");
 
                     b.HasKey("Id")
                         .HasName("pk_payment_allocations");

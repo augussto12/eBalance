@@ -28,7 +28,9 @@ public static class IpMinimizer
 /// <summary>TOTP (RFC 6238) con Otp.NET. Ventana ±1 paso de 30 s y bloqueo atómico de reutilización por usuario.</summary>
 public sealed class TotpService(IDataProtectionProvider dp, TimeProvider clock)
 {
-    private readonly IDataProtector _protector = dp.CreateProtector("AlvarezFinanzas.Totp.v1");
+    /// <summary>Propósito de Data Protection de los secretos TOTP (también lo usa la verificación del key ring).</summary>
+    public const string Purpose = "AlvarezFinanzas.Totp.v1";
+    private readonly IDataProtector _protector = dp.CreateProtector(Purpose);
     public const string Issuer = "Álvarez Finanzas";
 
     public string NewProtectedSecret(out string base32)
