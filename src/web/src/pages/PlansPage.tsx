@@ -1,26 +1,40 @@
 import { useEffect, useMemo, useState } from 'react';
-import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { keepPreviousData, useQuery, useQueryClient } from '@tanstack/react-query';
 import { ApiError, api, idempotencyKey } from '../api/client';
-import type { Obligation, Occurrence, Page, Plan } from '../api/types';
+import type { Obligation, Occurrence, Page, Payment, Plan } from '../api/types';
 import { FieldError, Modal } from '../components/Modal';
+import { PaymentHistoryDialog, PaymentList } from '../components/Payments';
 import { OccurrenceTable, QueryState } from '../components/Records';
 import { useUi } from '../components/Ui';
 import { formatDate, todayIso } from '../lib/dates';
 import { formatMoney, minorToInput, parseAmountInput, type Currency } from '../lib/money';
+import { isPaymentsApplied, paymentsOfPlan, type PaymentHistoryTarget } from '../lib/payments';
 import { invalidateFinancial, useAccounts } from './queries';
 
 type PayTarget = { planId?: string; accountId?: string } | null;
+
+/** Igual que Movimientos: las cuotas del mes se paginan en el servidor (antes se pedían 100 y el resto se perdía). */
+const PAGE_SIZE = 25;
+const RECENT_PAYMENTS = 8;
 
 export function PlansPage({ kind }: { kind: 'card' | 'loan' }) {
   const { month, currency, openRecord, confirm, toast } = useUi();
   const qc = useQueryClient();
   const [payTarget, setPayTarget] = useState<PayTarget>(null);
+  const [history, setHistory] = useState<PaymentHistoryTarget | null>(null);
+  const [page, setPage] = useState(1);
   const title = kind === 'card' ? 'Tarjetas y cuotas' : 'Préstamos';
+  useEffect(() => setPage(1), [kind, month, currency]);
 
   const monthRows = useQuery({
-    queryKey: ['movements', month, currency, '', kind, 1],
-    queryFn: ({ signal }) => api<Page<Occurrence>>('GET', `/movements?month=${month}&currency=${currency}&type=${kind}&pageSize=100`, undefined, { signal }),
+    queryKey: ['movements', month, currency, '', kind, page, PAGE_SIZE],
+    queryFn: ({ signal }) => {
+      const params = new URLSearchParams({ month, currency, type: kind, page: String(page), pageSize: String(PAGE_SIZE) });
+      return api<Page<Occurrence>>('GET', `/movements?${params}`, undefined, { signal });
+    },
+    placeholderData: keepPreviousData,
   });
+  const pages = monthRows.data ? Math.max(1, Math.ceil(monthRows.data.total / PAGE_SIZE)) : 1;
   const plans = useQuery({
     queryKey: ['plans', kind, currency],
     queryFn: ({ signal }) => api<Plan[]>('GET', `/plans?kind=${kind}&currency=${currency}`, undefined, { signal }),
@@ -35,13 +49,27 @@ export function PlansPage({ kind }: { kind: 'card' | 'loan' }) {
     });
     if (!ok) return;
     try {
-      await api('DELETE', `/plans/${p.id}?version=${p.version}`);
+      const deleted = await api<Plan>('DELETE', `/plans/${p.id}?version=${p.version}`);
       await invalidateFinancial(qc);
       toast('Plan eliminado', {
-        action: { label: 'Deshacer', run: async () => { await api('POST', `/plans/${p.id}/restore`); await invalidateFinancial(qc); } },
+        action: {
+          label: 'Deshacer',
+          run: async () => {
+            try {
+              await api('POST', `/plans/${p.id}/restore?version=${deleted.version}`);
+              await invalidateFinancial(qc);
+              toast('Plan restaurado');
+            } catch (err) {
+              toast(err instanceof ApiError ? err.title : 'No se pudo restaurar.', { error: true });
+            }
+          },
+        },
       });
     } catch (e) {
-      toast(e instanceof ApiError ? e.title : 'No se pudo eliminar.', { error: true });
+      // Con pagos aplicados el aviso lleva a esos pagos, donde se pueden revertir.
+      if (isPaymentsApplied(e)) toast(e.title, { error: true, action: { label: 'Ver pagos', run: () => setHistory(paymentsOfPlan(p.id, p.concept)) } });
+      else toast(e instanceof ApiError ? e.title : 'No se pudo eliminar.', { error: true });
+      await invalidateFinancial(qc);
     }
   };
 
@@ -59,7 +87,22 @@ export function PlansPage({ kind }: { kind: 'card' | 'loan' }) {
             <button onClick={() => openRecord({ mode: 'create', type: kind })}>＋ Agregar</button>
           </div>
         </div>
-        {monthRows.data ? <OccurrenceTable rows={monthRows.data.items} currency={currency} /> : <QueryState isPending={monthRows.isPending} error={monthRows.error} onRetry={() => monthRows.refetch()} />}
+        {monthRows.data ? (
+          <>
+            <OccurrenceTable rows={monthRows.data.items} currency={currency} />
+            {monthRows.data.total > PAGE_SIZE && (
+              <div className="pager">
+                <span>{monthRows.data.total} cuotas · página {page} de {pages}</span>
+                <div>
+                  <button disabled={page <= 1} onClick={() => setPage((n) => n - 1)}>‹ Anterior</button>
+                  <button disabled={page >= pages} onClick={() => setPage((n) => n + 1)}>Siguiente ›</button>
+                </div>
+              </div>
+            )}
+          </>
+        ) : (
+          <QueryState isPending={monthRows.isPending} error={monthRows.error} onRetry={() => monthRows.refetch()} />
+        )}
       </section>
       <section className="panel wide">
         <div className="panelhead">
@@ -107,6 +150,7 @@ export function PlansPage({ kind }: { kind: 'card' | 'loan' }) {
                       <td>
                         <div className="rowactions">
                           {!p.finished && <button className="delete" title="Registrar pago" aria-label={`Registrar pago de ${p.concept}`} onClick={() => setPayTarget({ planId: p.id })}>$</button>}
+                          {p.hasPayments && <button className="delete" title="Ver pagos" aria-label={`Ver pagos de ${p.concept}`} onClick={() => setHistory(paymentsOfPlan(p.id, p.concept))}>≡</button>}
                           <button className="delete" title="Editar" aria-label={`Editar ${p.concept}`} onClick={() => openRecord({ mode: 'edit-plan', id: p.id })}>✎</button>
                           <button className="delete" title="Eliminar" aria-label={`Eliminar ${p.concept}`} onClick={() => removePlan(p)}>×</button>
                         </div>
@@ -121,7 +165,20 @@ export function PlansPage({ kind }: { kind: 'card' | 'loan' }) {
           <QueryState isPending={plans.isPending} error={plans.error} onRetry={() => plans.refetch()} />
         )}
       </section>
+      <section className="panel stacked" id="pagos">
+        <div className="panelhead">
+          <div>
+            <h2>Pagos registrados</h2>
+            <p>{kind === 'card' ? 'Pagos de resúmenes, cuotas y consumos con tarjeta' : 'Pagos de cuotas de préstamos'} en {currency}. Revertir un pago devuelve lo que canceló a pendiente.</p>
+          </div>
+          <div className="tools">
+            <button onClick={() => setHistory({ title: kind === 'card' ? 'Historial de pagos de tarjetas' : 'Historial de pagos de préstamos', filter: { kind, currency } })}>Ver historial</button>
+          </div>
+        </div>
+        <PaymentList filter={{ kind, currency }} limit={RECENT_PAYMENTS} emptyText={`Todavía no hay pagos registrados en ${currency}.`} />
+      </section>
       <PaymentDialog kind={kind} currency={currency} target={payTarget} plans={plans.data ?? []} onClose={() => setPayTarget(null)} />
+      <PaymentHistoryDialog target={history} onClose={() => setHistory(null)} />
     </>
   );
 }
@@ -184,7 +241,7 @@ function PaymentDialog({ kind, currency, target, plans, onClose }: { kind: 'card
     setBusy(true);
     setFormError(null);
     try {
-      await api('POST', '/payments', {
+      const created = await api<Payment>('POST', '/payments', {
         sourceAccountId: source,
         date,
         currency,
@@ -192,7 +249,21 @@ function PaymentDialog({ kind, currency, target, plans, onClose }: { kind: 'card
         ...(whatType === 'plan' ? { planId: whatId } : { targetAccountId: whatId }),
       }, { headers: { 'Idempotency-Key': key } });
       await invalidateFinancial(qc);
-      toast('Pago registrado');
+      toast('Pago registrado', {
+        action: {
+          label: 'Deshacer',
+          run: async () => {
+            try {
+              await api('DELETE', `/payments/${created.id}?version=${created.version}`);
+              await invalidateFinancial(qc);
+              toast('Pago revertido');
+            } catch (err) {
+              await invalidateFinancial(qc);
+              toast(err instanceof ApiError ? err.title : 'No se pudo revertir el pago.', { error: true });
+            }
+          },
+        },
+      });
       onClose();
     } catch (err) {
       if (err instanceof ApiError) {

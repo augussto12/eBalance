@@ -429,6 +429,34 @@ public class PaymentsAndPlansTests(PostgresFixture pg)
         Assert.Equal(JsonValueKind.Null, (await a.GetJson($"/api/v1/accounts/{bank}")).GetProperty("cashBalanceMinor").ValueKind);
     }
 
+    /// <summary>Aunque una fila incoherente llegue a la base (sin pasar por la API), el saldo nunca suma otra moneda.</summary>
+    [Fact]
+    public async Task Balances_never_mix_currencies_even_with_incoherent_rows()
+    {
+        await using var app = await TestApp.StartAsync(pg);
+        var a = await app.SignedInAsync();
+        var bank = await a.AccountAsync("Banco");
+        var visa = await a.AccountAsync("Visa", "credit_card");
+        await a.PatchAsync($"/api/v1/accounts/{bank}", new { name = "Banco", openingBalanceMinor = "0", openingDate = "2026-10-01", version = 1 });
+        var entry = Guid.Parse((await a.PostJson("/api/v1/entries", new { kind = "expense", concept = "Ok", amountMinor = "1000", currency = "ARS", date = "2026-10-02", accountId = bank })).Str("id"));
+        var plan = Guid.Parse((await a.PostJson("/api/v1/plans", PlanBody(visa, "3000", 3, "2026-10-10"))).Str("id"));
+        var loan = Guid.Parse((await a.PostJson("/api/v1/plans", PlanBody(null, "3000", 3, "2026-10-10", kind: "loan"))).Str("id"));
+        Assert.Equal("-1000", (await a.GetJson($"/api/v1/accounts/{bank}")).Str("cashBalanceMinor"));
+
+        using (var scope = app.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            (await db.Entries.SingleAsync(e => e.Id == entry)).Currency = Currency.USD;
+            (await db.Plans.SingleAsync(p => p.Id == plan)).Currency = Currency.USD;
+            // Cuenta de acreditación sin capital: la base lo admite; antes rompía el cálculo de saldos.
+            (await db.Plans.SingleAsync(p => p.Id == loan)).DisbursementAccountId = bank;
+            await db.SaveChangesAsync();
+        }
+        var accounts = (await a.GetJson("/api/v1/accounts")).EnumerateArray().ToDictionary(x => x.Str("name"));
+        Assert.Equal("0", accounts["Banco"].Str("cashBalanceMinor"));
+        Assert.Equal("0", accounts["Visa"].Str("pendingObligationsMinor"));
+    }
+
     [Fact]
     public async Task Accounts_and_categories_can_be_read_by_id_only_by_their_owner()
     {

@@ -106,3 +106,15 @@ details.more summary{cursor:pointer;padding:6px 0}
   .qr{flex-direction:column;align-items:flex-start}
   .panelhead{flex-wrap:wrap;gap:12px}
 }
+
+/* Historial de pagos (Tarjetas y Préstamos): panel bajo los planes y lista que entra en el modal y en el celular */
+.panel.stacked{margin-top:22px}
+.paylist{list-style:none;margin:0;padding:0}
+.paylist li{border-bottom:1px solid #26292c;padding:12px 0;font-size:12px;line-height:1.5}
+.paylist .payrow{display:flex;justify-content:space-between;align-items:center;gap:12px}
+.paylist .payrow strong{font-weight:600}
+.paylist small{display:block;color:var(--muted);font-size:11px;margin-top:3px}
+.paylist .payrow small{margin:0}
+.paylist .delete{font-size:12px;text-decoration:underline}
+.paylist li.reversed,.paylist li.reversed strong{color:var(--muted)}
+.paylist li.reversed strong.num{text-decoration:line-through}

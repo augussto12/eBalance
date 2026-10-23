@@ -74,7 +74,7 @@ public static class PlanEndpoints
             currentInstallment = current?.Number ?? 0,
             remainingInstallments = inst.Count(i => i.DueDate > today),
             nextDue = next is null ? null : new { number = next.Number, dueDate = next.DueDate.Api(), pendingMinor = Money.ToApi(next.PendingMinor) },
-            hasPayments = inst.Any(i => i.PaidMinor > 0),
+            hasPayments = HasAppliedPayments(p), // bloqueo del cronograma en la UI: misma condición que Update y Delete
             finished = inst.All(i => i.PendingMinor == 0),
             version = p.Version,
             deletedAt = p.DeletedAt,

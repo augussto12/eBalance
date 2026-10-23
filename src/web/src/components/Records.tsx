@@ -1,13 +1,19 @@
+import { useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { ApiError, api } from '../api/client';
 import type { Occurrence } from '../api/types';
 import { formatDate } from '../lib/dates';
 import { formatMoney, type Currency } from '../lib/money';
+import { isPaymentsApplied, occurrenceHasPayments, paymentsOfOccurrence, paymentsOfPlan, type PaymentHistoryTarget } from '../lib/payments';
 import { invalidateFinancial } from '../pages/queries';
+import { PaymentHistoryDialog } from './Payments';
 import { useUi } from './Ui';
 
-/** Eliminación reversible con confirmación (modal, no confirm()) y «Deshacer». */
-export function useDeleteOccurrence() {
+/**
+ * Eliminación reversible con confirmación (modal, no confirm()) y «Deshacer». Restaurar exige la versión que devolvió
+ * el borrado. Si el registro tiene pagos aplicados, el aviso ofrece la lista de pagos para revertirlos.
+ */
+export function useDeleteOccurrence(showPayments?: (target: PaymentHistoryTarget) => void) {
   const qc = useQueryClient();
   const { confirm, toast } = useUi();
   return async (o: Occurrence) => {
@@ -23,14 +29,14 @@ export function useDeleteOccurrence() {
     if (!ok) return;
     const base = isInstallment ? `/plans/${o.planId}` : `/entries/${o.id}`;
     try {
-      await api('DELETE', `${base}?version=${o.version}`);
+      const deleted = await api<{ version: number }>('DELETE', `${base}?version=${o.version}`);
       await invalidateFinancial(qc);
       toast('Registro eliminado', {
         action: {
           label: 'Deshacer',
           run: async () => {
             try {
-              await api('POST', `${base}/restore`);
+              await api('POST', `${base}/restore?version=${deleted.version}`);
               await invalidateFinancial(qc);
               toast('Registro restaurado');
             } catch (e) {
@@ -40,7 +46,12 @@ export function useDeleteOccurrence() {
         },
       });
     } catch (e) {
-      toast(e instanceof ApiError ? e.title : 'No se pudo eliminar.', { error: true });
+      if (isPaymentsApplied(e) && showPayments) {
+        const target = isInstallment ? paymentsOfPlan(o.planId!, o.concept) : paymentsOfOccurrence(o);
+        toast(e.title, { error: true, action: { label: 'Ver pagos', run: () => showPayments(target) } });
+      } else {
+        toast(e instanceof ApiError ? e.title : 'No se pudo eliminar.', { error: true });
+      }
       await invalidateFinancial(qc);
     }
   };
@@ -63,10 +74,12 @@ export function EmptyState() {
 /** Tabla de movimientos con la misma estructura que el prototipo; los textos se renderizan siempre como texto. */
 export function OccurrenceTable({ rows, currency }: { rows: Occurrence[]; currency: Currency }) {
   const { openRecord } = useUi();
-  const remove = useDeleteOccurrence();
+  const [payments, setPayments] = useState<PaymentHistoryTarget | null>(null);
+  const remove = useDeleteOccurrence(setPayments);
   if (!rows.length) return <EmptyState />;
   return (
     <div className="tablewrap">
+      <PaymentHistoryDialog target={payments} onClose={() => setPayments(null)} />
       <table>
         <thead>
           <tr>
@@ -92,6 +105,9 @@ export function OccurrenceTable({ rows, currency }: { rows: Occurrence[]; curren
               <td className={r.kind === 'income' ? 'green' : undefined}>{r.kind === 'income' ? '+' : '−'} {formatMoney(r.amountMinor, currency)}</td>
               <td>
                 <div className="rowactions">
+                  {occurrenceHasPayments(r) && (
+                    <button className="delete" aria-label={`Ver pagos de ${r.concept}`} title="Ver pagos" onClick={() => setPayments(paymentsOfOccurrence(r))}>≡</button>
+                  )}
                   <button
                     className="delete"
                     aria-label={`Editar ${r.concept}`}

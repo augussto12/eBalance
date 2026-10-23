@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { useLocation } from 'react-router';
-import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query';
 import { ApiError, api, download, idempotencyKey, resetCsrf } from '../api/client';
 import type { Account, AccountKind, Category, ImportPreview, Me, SessionInfo, Transfer, TrashItem } from '../api/types';
 import { FieldError } from '../components/Modal';
@@ -14,6 +14,23 @@ const KIND_LABEL: Record<AccountKind, string> = { cash: 'Efectivo', bank: 'Banco
 
 function errorText(e: unknown, fallback: string): string {
   return e instanceof ApiError ? e.title : fallback;
+}
+
+/** «Deshacer» de un archivado/borrado: restaura con la versión que devolvió el DELETE (el servidor la exige). */
+function undoAction(qc: QueryClient, toast: (text: string, options?: { error?: boolean }) => void, path: string, version: number) {
+  return {
+    label: 'Deshacer',
+    run: async () => {
+      try {
+        await api('POST', `${path}/restore?version=${version}`);
+        await invalidateFinancial(qc);
+        toast('Restaurado');
+      } catch (err) {
+        await invalidateFinancial(qc);
+        toast(errorText(err, 'No se pudo restaurar.'), { error: true });
+      }
+    },
+  };
 }
 
 export function SettingsPage({ me }: { me: Me }) {
@@ -94,9 +111,9 @@ function Accounts() {
   const archive = async (a: Account) => {
     if (!(await confirm({ title: 'Archivar cuenta', message: <>«{a.name}» deja de aparecer al cargar movimientos. Los registros existentes la conservan.</>, confirmLabel: 'Archivar', danger: true }))) return;
     try {
-      await api('DELETE', `/accounts/${a.id}?version=${a.version}`);
+      const archived = await api<Account>('DELETE', `/accounts/${a.id}?version=${a.version}`);
       await invalidateFinancial(qc);
-      toast('Cuenta archivada', { action: { label: 'Deshacer', run: async () => { await api('POST', `/accounts/${a.id}/restore`); await invalidateFinancial(qc); } } });
+      toast('Cuenta archivada', { action: undoAction(qc, toast, `/accounts/${a.id}`, archived.version) });
     } catch (err) {
       toast(errorText(err, 'No se pudo archivar.'), { error: true });
     }
@@ -121,7 +138,7 @@ function Accounts() {
                       {a.kind === 'credit_card'
                         ? <>{formatMoney(a.pendingObligationsMinor ?? '0', a.currency)}<small>pendiente total</small></>
                         : a.cashBalanceMinor !== null
-                          ? <>{formatMoney(a.cashBalanceMinor, a.currency)}<small>desde {formatDate(a.openingDate!)} · solo movimientos registrados</small></>
+                          ? <>{formatMoney(a.cashBalanceMinor, a.currency)}<small>desde {formatDate(a.openingDate!)}{a.cashBalanceAsOf && <> hasta {formatDate(a.cashBalanceAsOf)}</>} · solo movimientos registrados</small></>
                           : <small>Sin saldo inicial</small>}
                     </td>
                     <td><div className="rowactions">
@@ -220,9 +237,9 @@ function Categories() {
   };
   const archive = async (c: Category) => {
     try {
-      await api('DELETE', `/categories/${c.id}?version=${c.version}`);
+      const archived = await api<Category>('DELETE', `/categories/${c.id}?version=${c.version}`);
       await invalidateFinancial(qc);
-      toast('Categoría archivada', { action: { label: 'Deshacer', run: async () => { await api('POST', `/categories/${c.id}/restore`); await invalidateFinancial(qc); } } });
+      toast('Categoría archivada', { action: undoAction(qc, toast, `/categories/${c.id}`, archived.version) });
     } catch (err) {
       toast(errorText(err, 'No se pudo archivar.'), { error: true });
     }
@@ -277,9 +294,9 @@ function Transfers() {
   };
   const remove = async (t: Transfer) => {
     try {
-      await api('DELETE', `/transfers/${t.id}?version=${t.version}`);
+      const deleted = await api<Transfer>('DELETE', `/transfers/${t.id}?version=${t.version}`);
       await invalidateFinancial(qc);
-      toast('Transferencia eliminada', { action: { label: 'Deshacer', run: async () => { await api('POST', `/transfers/${t.id}/restore`); await invalidateFinancial(qc); } } });
+      toast('Transferencia eliminada', { action: undoAction(qc, toast, `/transfers/${t.id}`, deleted.version) });
     } catch (err) {
       toast(errorText(err, 'No se pudo eliminar.'), { error: true });
     }
@@ -573,10 +590,12 @@ function Trash() {
   const restore = async (t: TrashItem) => {
     const base = t.type === 'entry' ? 'entries' : t.type === 'transfer' ? 'transfers' : 'plans';
     try {
-      await api('POST', `/${base}/${t.id}/restore`);
+      // La versión que muestra la papelera: si otro cambio la modificó, el servidor responde 409 y se recarga.
+      await api('POST', `/${base}/${t.id}/restore?version=${t.version}`);
       await invalidateFinancial(qc);
       toast('Registro restaurado');
     } catch (err) {
+      await invalidateFinancial(qc);
       toast(errorText(err, 'No se pudo restaurar.'), { error: true });
     }
   };

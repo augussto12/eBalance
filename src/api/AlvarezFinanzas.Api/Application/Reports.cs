@@ -92,31 +92,33 @@ public sealed class BalanceService(AppDbContext db, TimeProvider clock)
 
         var entries = await db.Entries.AsNoTracking()
             .Where(e => e.OwnerId == owner && e.DeletedAt == null && e.AccountId != null && ids.Contains(e.AccountId.Value))
-            .Select(e => new { AccountId = e.AccountId!.Value, e.Kind, e.AmountMinor, e.PaidMinor, e.EffectiveDate })
+            .Select(e => new { AccountId = e.AccountId!.Value, e.Kind, e.AmountMinor, e.PaidMinor, e.EffectiveDate, e.Currency })
             .ToListAsync(ct);
         var payments = await db.Payments.AsNoTracking()
             .Where(p => p.OwnerId == owner && p.DeletedAt == null && ids.Contains(p.SourceAccountId))
-            .Select(p => new { p.SourceAccountId, p.AmountMinor, p.Date })
+            .Select(p => new { p.SourceAccountId, p.AmountMinor, p.Date, p.Currency })
             .ToListAsync(ct);
         var transfers = await db.Transfers.AsNoTracking()
             .Where(t => t.OwnerId == owner && t.DeletedAt == null && (ids.Contains(t.FromAccountId) || ids.Contains(t.ToAccountId)))
-            .Select(t => new { t.FromAccountId, t.ToAccountId, t.AmountMinor, t.Date })
+            .Select(t => new { t.FromAccountId, t.ToAccountId, t.AmountMinor, t.Date, t.Currency })
             .ToListAsync(ct);
         var disbursements = await db.Plans.AsNoTracking()
-            .Where(p => p.OwnerId == owner && p.DeletedAt == null && p.DisbursementAccountId != null && ids.Contains(p.DisbursementAccountId.Value))
-            .Select(p => new { AccountId = p.DisbursementAccountId!.Value, Amount = p.DisbursementMinor!.Value, Date = p.DisbursementDate!.Value })
+            .Where(p => p.OwnerId == owner && p.DeletedAt == null && p.DisbursementAccountId != null && ids.Contains(p.DisbursementAccountId.Value)
+                        && p.DisbursementMinor != null && p.DisbursementDate != null)
+            .Select(p => new { AccountId = p.DisbursementAccountId!.Value, Amount = p.DisbursementMinor!.Value, Date = p.DisbursementDate!.Value, p.Currency })
             .ToListAsync(ct);
         var cardInstallments = await db.Installments.AsNoTracking()
             .Where(i => i.OwnerId == owner && i.Plan!.DeletedAt == null && i.Plan.AccountId != null && ids.Contains(i.Plan.AccountId.Value) && !i.DeclaredPaid)
-            .Select(i => new { AccountId = i.Plan!.AccountId!.Value, Pending = i.AmountMinor - i.PaidMinor })
+            .Select(i => new { AccountId = i.Plan!.AccountId!.Value, Pending = i.AmountMinor - i.PaidMinor, i.Plan.Currency })
             .ToListAsync(ct);
 
+        // Defensa: nunca se suman importes de otra moneda que la de la cuenta, aunque un dato incoherente lo referencie.
         foreach (var a in accounts)
         {
             if (a.Kind == AccountKind.CreditCard)
             {
-                var pending = Money.Sum(cardInstallments.Where(x => x.AccountId == a.Id).Select(x => x.Pending))
-                              + Money.Sum(entries.Where(x => x.AccountId == a.Id && x.Kind == EntryKind.Expense).Select(x => x.AmountMinor - x.PaidMinor));
+                var pending = checked(Money.Sum(cardInstallments.Where(x => x.AccountId == a.Id && x.Currency == a.Currency).Select(x => x.Pending))
+                              + Money.Sum(entries.Where(x => x.AccountId == a.Id && x.Currency == a.Currency && x.Kind == EntryKind.Expense).Select(x => x.AmountMinor - x.PaidMinor)));
                 result[a.Id] = new AccountBalance(null, pending);
                 continue;
             }
@@ -126,16 +128,16 @@ public sealed class BalanceService(AppDbContext db, TimeProvider clock)
                 continue;
             }
             var balance = opening;
-            foreach (var e in entries.Where(x => x.AccountId == a.Id && x.EffectiveDate >= from && x.EffectiveDate <= today))
+            foreach (var e in entries.Where(x => x.AccountId == a.Id && x.Currency == a.Currency && x.EffectiveDate >= from && x.EffectiveDate <= today))
                 balance = e.Kind == EntryKind.Income ? checked(balance + e.AmountMinor) : checked(balance - e.AmountMinor);
-            foreach (var p in payments.Where(x => x.SourceAccountId == a.Id && x.Date >= from && x.Date <= today))
+            foreach (var p in payments.Where(x => x.SourceAccountId == a.Id && x.Currency == a.Currency && x.Date >= from && x.Date <= today))
                 balance = checked(balance - p.AmountMinor);
-            foreach (var t in transfers.Where(x => x.Date >= from && x.Date <= today))
+            foreach (var t in transfers.Where(x => x.Currency == a.Currency && x.Date >= from && x.Date <= today))
             {
                 if (t.FromAccountId == a.Id) balance = checked(balance - t.AmountMinor);
                 if (t.ToAccountId == a.Id) balance = checked(balance + t.AmountMinor);
             }
-            foreach (var d in disbursements.Where(x => x.AccountId == a.Id && x.Date >= from && x.Date <= today))
+            foreach (var d in disbursements.Where(x => x.AccountId == a.Id && x.Currency == a.Currency && x.Date >= from && x.Date <= today))
                 balance = checked(balance + d.Amount);
             result[a.Id] = new AccountBalance(balance, null, today);
         }
