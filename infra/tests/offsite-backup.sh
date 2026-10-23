@@ -60,6 +60,14 @@ ok "segunda copia (incremental) OK"
 if (( rotate )); then
   info "Rotación de la contraseña de restic (local + externo)"
   cp -p "$SECRETS_DIR/restic_password" "$tmp/old_password"
+  # Con el repositorio externo caído, la rotación no empieza: nada cambia y no se pierde el acceso.
+  docker stop "$name" >/dev/null
+  if "$ROOT/infra/scripts/rotate-secrets.sh" restic >"$tmp/out" 2>&1; then cat "$tmp/out"; fail "rotó con el repositorio externo caído"; fi
+  cmp -s "$SECRETS_DIR/restic_password" "$tmp/old_password" || fail "cambió restic_password con el externo caído"
+  [[ ! -e "$SECRETS_DIR/restic_password.previous" && ! -e "$SECRETS_DIR/restic_password.new" ]] || fail "quedaron archivos de una rotación fallida"
+  docker start "$name" >/dev/null
+  for _ in $(seq 1 20); do backup_ops key-check offsite /run/secrets/restic_password >/dev/null 2>&1 && break; sleep 0.5; done
+  ok "con el repositorio externo caído la rotación no empieza y la contraseña vigente no cambia"
   oldm="$tmp/old_password:/run/alvarez/old_password:ro"
   "$ROOT/infra/scripts/rotate-secrets.sh" restic
   [[ -s "$SECRETS_DIR/restic_password.previous" ]] || fail "no quedó restic_password.previous"
