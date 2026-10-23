@@ -124,7 +124,9 @@ case "${1:-}" in
   key-check)
     use_repo "${2:-}"
     pw="${3:?Falta el archivo de contraseña}"
-    RESTIC_PASSWORD_FILE="$pw" restic cat config >/dev/null || die "La contraseña de $pw no abre el repositorio ${2}."
+    # restic reintenta hasta ~15 min si el destino no responde; para esta comprobación previa alcanza con menos.
+    RESTIC_PASSWORD_FILE="$pw" timeout "${KEY_CHECK_TIMEOUT:-90}" restic cat config >/dev/null \
+      || die "El repositorio ${2} no responde o la contraseña de $pw no lo abre."
     ;;
   key-add)
     use_repo "${2:-}"
