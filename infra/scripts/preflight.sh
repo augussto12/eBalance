@@ -5,6 +5,7 @@ load_env
 fail=0
 ok() { echo "OK    $*"; }
 bad() { echo "FALLA $*"; fail=1; }
+note() { echo "AVISO $*"; }
 
 command -v docker >/dev/null && ok "docker instalado" || bad "docker no instalado"
 docker compose version >/dev/null 2>&1 && ok "docker compose disponible" || bad "docker compose no disponible"
@@ -23,8 +24,28 @@ done
 [[ "$(stat -c %a "$SECRETS_DIR")" == 700 ]] && ok "directorio de secretos 700" || bad "el directorio de secretos debe tener modo 700"
 if git -C "$ROOT" ls-files --error-unmatch "$SECRETS_DIR" >/dev/null 2>&1; then bad "¡hay secretos versionados en Git!"; else ok "secretos fuera de Git"; fi
 
-avail_kb=$(df -Pk "$ROOT" | awk 'NR==2{print $4}')
-(( avail_kb > 2*1024*1024 )) && ok "espacio libre $((avail_kb/1024)) MiB" || bad "menos de 2 GiB libres"
+check_disks ok bad || true
+
+# Reloj: los códigos TOTP dependen de la hora del servidor.
+ntp_rc=0; msg="$(check_ntp)" || ntp_rc=$?
+case "$ntp_rc" in 0) ok "$msg" ;; 1) bad "$msg" ;; *) note "$msg" ;; esac
+
+# Copia fuera de la VPS: sin ella, el único backup (y su contraseña) quedan en este servidor.
+if offsite_configured; then
+  case "$OFFSITE_RESTIC_REPOSITORY" in
+    /*|local:*) note "OFFSITE_RESTIC_REPOSITORY es una ruta local: no es una copia fuera de la VPS" ;;
+    sftp:*|rclone:*) bad "OFFSITE_RESTIC_REPOSITORY usa ${OFFSITE_RESTIC_REPOSITORY%%:*}, que la imagen de backup no incluye: usá s3:, b2:, azure:, gs:, swift: o rest: (RUNBOOK §4)" ;;
+    *) ok "copia externa configurada (${OFFSITE_RESTIC_REPOSITORY%%:*})" ;;
+  esac
+  if [[ -e "$OFFSITE_RESTIC_ENV_FILE" ]]; then
+    mode=$(stat -c %a "$OFFSITE_RESTIC_ENV_FILE")
+    [[ "$mode" =~ ^[0-7][0-4]0$ ]] && ok "credenciales del repositorio externo (modo $mode)" || bad "$OFFSITE_RESTIC_ENV_FILE con permisos amplios ($mode)"
+  fi
+else
+  note "sin copia de backups fuera de la VPS (OFFSITE_RESTIC_REPOSITORY): el único backup está en este servidor (RUNBOOK §4)"
+fi
+[[ ! -e "$SECRETS_DIR/restic_password.previous" ]] \
+  || note "rotación de restic sin confirmar: guardá la contraseña nueva fuera del servidor y corré rotate-secrets.sh restic-confirm"
 
 compose_json="$(mktemp)"
 if dc config --format json >"$compose_json" 2>/dev/null; then

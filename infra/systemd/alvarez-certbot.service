@@ -4,6 +4,7 @@
 Description=Álvarez Finanzas — renovación de certificado TLS
 Wants=docker.service
 After=docker.service network-online.target
+OnFailure=alvarez-alert@%n.service
 
 [Service]
 Type=oneshot

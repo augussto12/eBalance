@@ -21,26 +21,28 @@ result=FALLA
 cleanup() {
   docker rm -f "$proj-db" "$proj-api" >/dev/null 2>&1 || true
   docker network rm "$net" >/dev/null 2>&1 || true
-  docker run --rm -v "$work:/w" --entrypoint sh "$backup_img" -c 'rm -rf /w/*' >/dev/null 2>&1 || true
+  docker run --rm --user 0 -v "$work:/w" --entrypoint sh "$backup_img" -c 'rm -rf /w/*' >/dev/null 2>&1 || true
   rm -rf "$work"
   echo "$(date -u +%FT%TZ) restore-test snapshot=$snap resultado=$result duracion=$(( $(date +%s) - started ))s" | tee -a "$BACKUP_DIR/restore-tests.log"
 }
 trap cleanup EXIT
+prepare_backup_perms
 
 snap="$(dc --profile ops run --rm -T backup resolve db "$requested" </dev/null | tr -d '\r')"
 keysnap="$(dc --profile ops run --rm -T backup resolve keyring latest </dev/null | tr -d '\r')"
 [[ -n "$snap" ]] || die "No se encontró la instantánea $requested"
 info "Extrayendo instantánea $snap (key ring $keysnap)"
-dc --profile ops run --rm -T -v "$work:/out" backup restore-dump "$snap" /out/alvarez.dump
-dc --profile ops run --rm -T -v "$work:/out" backup restore-keys "$keysnap" /out/keyring
+# Extracción como root (--user 0): escribe en este directorio temporal y conserva dueños y permisos del key ring.
+dc --profile ops run --rm -T --user 0 -v "$work:/out" backup restore-dump "$snap" /out/alvarez.dump
+dc --profile ops run --rm -T --user 0 -v "$work:/out" backup restore-keys "$keysnap" /out/keyring
 [[ -s "$work/alvarez.dump" ]] || die "El dump restaurado está vacío"
-docker run --rm -v "$work:/w" --entrypoint sh "$backup_img" -c "chown -R $APP_UID:$APP_UID /w/keyring && chmod -R go-rwx /w/keyring"
+docker run --rm --user 0 -v "$work:/w" --entrypoint sh "$backup_img" -c "chown -R $APP_UID:$APP_UID /w/keyring && chmod -R go-rwx /w/keyring"
 
 info "Base aislada"
 docker network create --internal "$net" >/dev/null
 pw="$(openssl rand -hex 24)"
 printf '%s' "$pw" > "$work/pw"
-docker run --rm -v "$work:/w" --entrypoint sh "$backup_img" -c "chown $APP_UID:$APP_UID /w/pw && chmod 400 /w/pw"
+docker run --rm --user 0 -v "$work:/w" --entrypoint sh "$backup_img" -c "chown $APP_UID:$APP_UID /w/pw && chmod 400 /w/pw"
 docker run -d --name "$proj-db" --network "$net" -e POSTGRES_USER=restore -e POSTGRES_DB=alvarez -e POSTGRES_PASSWORD="$pw" "$pg_img" >/dev/null
 for _ in $(seq 1 30); do docker exec "$proj-db" pg_isready -U restore -d alvarez -q && break; sleep 1; done
 sleep 2

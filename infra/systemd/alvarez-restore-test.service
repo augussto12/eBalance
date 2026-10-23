@@ -1,0 +1,11 @@
+# Prueba de restauración mensual en un entorno aislado (no toca producción). Resultado en BACKUP_DIR/restore-tests.log.
+[Unit]
+Description=Álvarez Finanzas — prueba de restauración aislada
+Wants=docker.service
+After=docker.service
+OnFailure=alvarez-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/srv/alvarez-finanzas/app
+ExecStart=/srv/alvarez-finanzas/app/infra/scripts/restore-test.sh

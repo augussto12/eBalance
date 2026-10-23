@@ -5,6 +5,7 @@ source "$(dirname "$0")/lib.sh"
 load_env
 requested="${1:?Indicá la instantánea (restic snapshots) o latest}"
 with_keys="${2:-}"
+prepare_backup_perms
 dc --profile ops run --rm -T backup snapshots </dev/null
 # El key ring más reciente contiene también las claves viejas (no se borran): se usa siempre el último.
 # Se fija el ID ANTES del backup de seguridad: si no, «latest» apuntaría a ese backup nuevo.
@@ -19,10 +20,12 @@ if [[ "$with_keys" == --with-keyring ]]; then
 fi
 
 info "Backup de seguridad del estado actual"
-BACKUP_NO_PRUNE=1 "$ROOT/infra/scripts/backup.sh" </dev/null
+BACKUP_NO_PRUNE=1 BACKUP_LOCAL_ONLY=1 "$ROOT/infra/scripts/backup.sh" </dev/null
 work="$(mktemp -d)"; chmod 700 "$work"
-trap 'docker run --rm -v "$work:/w" --entrypoint sh alvarez-finanzas-backup:${IMAGE_TAG:-local} -c "rm -rf /w/*"; rm -rf "$work"' EXIT
-dc --profile ops run --rm -T -v "$work:/out" backup restore-dump "$snap" /out/alvarez.dump </dev/null
+trap 'docker run --rm --user 0 -v "$work:/w" --entrypoint sh alvarez-finanzas-backup:${IMAGE_TAG:-local} -c "rm -rf /w/*"; rm -rf "$work"' EXIT
+# La extracción corre como root (--user 0) y no como el usuario del backup: escribe en este directorio temporal del
+# host y conserva dueños y permisos del key ring.
+dc --profile ops run --rm -T --user 0 -v "$work:/out" backup restore-dump "$snap" /out/alvarez.dump </dev/null
 
 info "Deteniendo API y web"
 dc stop web api </dev/null
@@ -32,8 +35,8 @@ dc --profile ops run --rm -T migrate </dev/null
 
 if [[ "$with_keys" == --with-keyring ]]; then
   info "Restaurando key ring $keysnap"
-  dc --profile ops run --rm -T -v "$work:/out" backup restore-keys "$keysnap" /out/keyring </dev/null
-  docker run --rm -v "$work/keyring/keys:/src:ro" -v "${COMPOSE_PROJECT_NAME:-alvarez-finanzas}_keys:/keys" --entrypoint sh "alvarez-finanzas-backup:${IMAGE_TAG:-local}" \
+  dc --profile ops run --rm -T --user 0 -v "$work:/out" backup restore-keys "$keysnap" /out/keyring </dev/null
+  docker run --rm --user 0 -v "$work/keyring/keys:/src:ro" -v "${COMPOSE_PROJECT_NAME:-alvarez-finanzas}_keys:/keys" --entrypoint sh "alvarez-finanzas-backup:${IMAGE_TAG:-local}" \
     -c "rm -f /keys/*.xml; cp -a /src/. /keys/ && chown -R $APP_UID:$APP_UID /keys && chmod 700 /keys"
 fi
 

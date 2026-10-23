@@ -1,0 +1,11 @@
+# Chequeo liviano cada hora: un servicio caído o el disco lleno se notan en menos de una hora (no solo en el diario).
+[Unit]
+Description=Álvarez Finanzas — chequeo de servicios y disco
+Wants=docker.service
+After=docker.service
+OnFailure=alvarez-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/srv/alvarez-finanzas/app
+ExecStart=/srv/alvarez-finanzas/app/infra/scripts/healthcheck.sh

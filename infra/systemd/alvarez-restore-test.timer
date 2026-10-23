@@ -1,0 +1,10 @@
+[Unit]
+Description=Prueba de restauración mensual de Álvarez Finanzas (primer domingo del mes, después del backup)
+
+[Timer]
+OnCalendar=Sun *-*-01..07 05:23:00
+RandomizedDelaySec=30m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

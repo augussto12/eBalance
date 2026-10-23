@@ -40,7 +40,9 @@ fix() { local f="$1" owner="$2" mode="$3"; [[ -e "$f" ]] || return 0; chown "$ow
 fix "$SECRETS_DIR/db_admin_password"    "$PG_UID:$PG_UID"   0400
 fix "$SECRETS_DIR/db_app_password"      "$PG_UID:$APP_UID"  0440
 fix "$SECRETS_DIR/db_migrator_password" "$PG_UID:$APP_UID"  0440
-fix "$SECRETS_DIR/restic_password"      "0:0"               0400
+# restic: lo lee el contenedor de backup, que corre como $BACKUP_UID (sin root).
+fix "$SECRETS_DIR/restic_password"      "0:$BACKUP_UID"     0440
+fix "$OFFSITE_RESTIC_ENV_FILE"          "0:$BACKUP_UID"     0440
 chown -R "$APP_UID:$APP_UID" "$SECRETS_DIR/keyring" 2>/dev/null || warn "No se pudo chown keyring (¿falta sudo?)"
 chmod 500 "$SECRETS_DIR/keyring"
 chmod 400 "$SECRETS_DIR"/keyring/*
