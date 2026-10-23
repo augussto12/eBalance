@@ -90,7 +90,7 @@ Sirve de evidencia para 1.1.4, 1.1.5 y 1.11.1. Complementa `docs/02-ARQUITECTURA
 | Contenedor `db` (PostgreSQL 18) | Roles separados: `alvarez_migrator` (DDL) y `alvarez_app` (DML sin UPDATE/DELETE en auditoría); FK compuestas por propietario; checks de importes | Red `backend` (`internal: true`) | `compose.yaml:17-36,119-121`, `infra/docker/postgres/01-roles.sh`, `API/Infrastructure/Cli.cs:70-94` |
 | `migrate` y CLI (perfil `ops`) | Migraciones con el rol migrador; comandos de operador por SSH: `bootstrap-owner`, `recover-owner`, `revoke-sessions`, `purge-audit`, `check-config`, `verify-data` | Operador con SSH y grupo `docker` | `API/Infrastructure/Cli.cs` |
 | `backup` (perfil `ops`) | `pg_dump` y key ring cifrados por restic antes de escribirse; copia off-site opcional | Redes `backend` y `egress` | `infra/docker/backup-entrypoint.sh`, `compose.yaml:97-117` |
-| Servicios remotos | Let's Encrypt (ACME http-01, certbot en contenedor); repositorio restic off-site (opcional, no probado); GitHub (código y CI); registros de imágenes y paquetes, solo al construir | — | `infra/scripts/certbot.sh`, `infra/scripts/backup.sh:10-15`, `.github/workflows/ci.yml` |
+| Servicios remotos | Let's Encrypt (ACME http-01, certbot en contenedor); repositorio restic off-site (opcional, no probado); GitHub (código y CI); registros de imágenes y paquetes, solo al construir | — | `infra/scripts/certbot.sh`, `infra/scripts/backup.sh:56-66`, `.github/workflows/ci.yml` |
 
 **Flujos:**
 
@@ -131,8 +131,8 @@ Sirve de evidencia para 1.6.x, 2.10.x y 6.4.x. Es también el registro de la ges
 
 | Clave o secreto | Uso | Almacenamiento | Rotación | Copia |
 |---|---|---|---|---|
-| Claves maestras de Data Protection | Tickets de sesión, cookies, tokens antiforgery, secretos TOTP | `keys:/keys`, XML cifrado con el certificado | Automática cada 90 días; las anteriores se conservan [B-6] | En el backup restic (cifrado) |
-| Certificado del key ring (RSA-3072, PFX AES-256-CBC, 10 años) y su contraseña | Cifra el key ring | `SECRETS_DIR/keyring` (0400; directorio 0500), montado en `/run/keyring:ro` | `rotate-secrets.sh keyring-cert`; los `previous-*.pfx` siguen descifrando (`API/Program.cs:96-108`) | Gestor de contraseñas del propietario, **fuera** del servidor; no va en el backup |
+| Claves maestras de Data Protection | Tickets de sesión, cookies, tokens antiforgery, secretos TOTP | `keys:/keys`, XML cifrado con el certificado | Automática cada 90 días; las anteriores se conservan [B-6] | En el backup restic (cifrado); un `/keys` sin claves no se respalda (`backup-entrypoint.sh:28-42`) |
+| Certificado del key ring (RSA-3072, PFX AES-256-CBC, 10 años) y su contraseña | Cifra el key ring | `SECRETS_DIR/keyring` (0400; directorio 0500), montado en `/run/keyring:ro` | `rotate-secrets.sh keyring-cert`; los `previous-*.pfx` siguen descifrando (`API/Program.cs:96-108`) y **no se borran nunca**: el key ring conserva las claves cifradas con cada certificado y los backups anteriores dependen de ellas (`docs/RUNBOOK.md` §7) | Gestor de contraseñas del propietario, **fuera** del servidor: el actual y todos los `previous-*.pfx` con su contraseña; no van en el backup |
 | Contraseñas de `alvarez_app` y `alvarez_migrator` | Conexión a la base | `SECRETS_DIR` (0440) | `rotate-secrets.sh db-app` y `db-migrator` | Gestor de contraseñas, opcional |
 | Contraseña de `alvarez_admin` (superusuario) | Administración de la base | `SECRETS_DIR` (0400) | **Sin script** de rotación | Gestor de contraseñas, opcional |
 | Contraseña de restic | Cifra los backups | `SECRETS_DIR/restic_password` (0400, root) | `rotate-secrets.sh restic` (no ejecutado según `IMPLEMENTATION-STATUS.md`) | Gestor de contraseñas, obligatorio |
@@ -312,7 +312,7 @@ Los secretos de 48 caracteres salen de `openssl rand` (`bootstrap-secrets.sh:16`
 
 | Req. | Requisito (resumen) | Estado | Evidencia |
 |---|---|---|---|
-| 6.1.1 | Datos personales regulados cifrados en reposo | parcial | Backups cifrados con restic (`backup-entrypoint.sh:18-21`) y secretos MFA cifrados. La base va en claro y el cifrado del volumen depende del proveedor (R5). |
+| 6.1.1 | Datos personales regulados cifrados en reposo | parcial | Backups cifrados con restic (`backup-entrypoint.sh:25-42`) y secretos MFA cifrados. La base va en claro y el cifrado del volumen depende del proveedor (R5). |
 | 6.1.2 | Datos de salud cifrados | no aplica | No hay datos de salud. |
 | 6.1.3 | Datos financieros regulados cifrados en reposo | parcial | Igual que 6.1.1. |
 | 6.2.1 | Los módulos criptográficos fallan de forma segura, sin padding oracle | cumple | Data Protection usa cifrado autenticado (AES-256-CBC + HMAC-SHA256, encrypt-then-MAC) [B-6]. Un fallo devuelve `null` o 401 sin detalle (`DbTicketStore.cs:127-130`). |

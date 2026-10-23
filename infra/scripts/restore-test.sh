@@ -29,8 +29,10 @@ trap cleanup EXIT
 prepare_backup_perms
 
 snap="$(dc --profile ops run --rm -T backup resolve db "$requested" </dev/null | tr -d '\r')"
-keysnap="$(dc --profile ops run --rm -T backup resolve keyring latest </dev/null | tr -d '\r')"
 [[ -n "$snap" ]] || die "No se encontró la instantánea $requested"
+# Igual que restore.sh: el key ring más reciente que tenga claves (una instantánea de /keys vacío no sirve).
+keysnap="$(backup_ops resolve-keyring | tr -d '\r')"
+[[ -n "$keysnap" ]] || die "No hay ninguna instantánea del key ring con claves"
 info "Extrayendo instantánea $snap (key ring $keysnap)"
 # Extracción como root (--user 0): escribe en este directorio temporal y conserva dueños y permisos del key ring.
 dc --profile ops run --rm -T --user 0 -v "$work:/out" backup restore-dump "$snap" /out/alvarez.dump

@@ -2,10 +2,14 @@
 # Rotación de secretos sin perder acceso. Acepta varios objetivos en una ejecución (se validan todos antes de empezar):
 #   ./infra/scripts/rotate-secrets.sh db-app db-migrator keyring-cert restic
 #   db-app | db-migrator   nueva contraseña del rol; psql la lee del archivo montado (no va en argumentos ni en SQL armado)
-#   keyring-cert           nuevo certificado; el anterior queda como previous-*.pfx para descifrar claves viejas
+#   keyring-cert           nuevo certificado; el anterior queda como previous-*.pfx para descifrar claves viejas. Guardá
+#                          fuera del servidor el nuevo Y los previous-*: no se borran nunca (RUNBOOK §7)
 #   restic                 agrega una clave nueva al repositorio local Y al externo (si hay). La anterior sigue válida y
 #                          queda en restic_password.previous hasta confirmar: nunca se pierde el acceso a los backups.
 #   restic-confirm         DESPUÉS de guardar la contraseña nueva fuera del servidor: quita la anterior de los repositorios.
+#                          Con un destino externo de solo agregar (OFFSITE_PRUNE=0) la clave anterior se quita allá desde
+#                          otra máquina: queda anotada en SECRETS_DIR/restic-offsite-key-pending y, una vez quitada,
+#                          «restic-confirm» de nuevo lo comprueba y borra la nota.
 # La API se reinicia una sola vez al final si hace falta (db-app, keyring-cert).
 source "$(dirname "$0")/lib.sh"
 load_env
@@ -47,7 +51,7 @@ rotate_keyring_cert() {
   cp -p "$dir/current.pfx" "$dir/previous-$stamp.pfx"; cp -p "$dir/current.password" "$dir/previous-$stamp.password"
   rm -f "$dir/current.pfx" "$dir/current.password"
   "$ROOT/infra/scripts/bootstrap-secrets.sh" >/dev/null
-  warn "Guardá el certificado NUEVO fuera del servidor. No borres previous-$stamp.* mientras existan claves o backups que lo necesiten (≥ 1 año recomendado)."
+  warn "Guardá fuera del servidor el certificado NUEVO (current.pfx y current.password) y también previous-$stamp.pfx y previous-$stamp.password. No los borres nunca: el key ring conserva las claves cifradas con cada certificado, y el centinela, los secretos TOTP y las sesiones de los backups anteriores dependen de ellas. Sin todos los certificados, la API puede no arrancar con un backup restaurado."
 }
 
 restic_repos() { echo local; if offsite_configured; then echo offsite; fi; }
@@ -84,16 +88,67 @@ rotate_restic() {
   warn "Guardá la contraseña NUEVA ($cur) en tu gestor de contraseñas, fuera del servidor. Después corré: ./infra/scripts/rotate-secrets.sh restic-confirm"
 }
 
+# Destino externo de solo agregar (OFFSITE_PRUNE=0): desde la VPS no se puede borrar nada allá, tampoco una clave. Las
+# claves anteriores que falta quitar quedan anotadas acá (son IDs, no secretos); preflight.sh y maintenance.sh avisan.
+pending_offsite="$SECRETS_DIR/restic-offsite-key-pending"
+offsite_append_only() { offsite_configured && [[ "${OFFSITE_PRUNE:-1}" != 1 ]]; }
+
+explain_pending_offsite() {
+  local id
+  warn "Destino externo de solo agregar (OFFSITE_PRUNE=0): la contraseña ANTERIOR todavía abre el repositorio externo."
+  warn "Desde una máquina de confianza con permiso de borrado en el destino (no desde esta VPS), quitá estas claves:"
+  while read -r id; do [[ -n "$id" ]] && warn "  restic -r <repositorio externo> key remove $id"; done < "$pending_offsite"
+  warn "Después corré «rotate-secrets.sh restic-confirm» de nuevo: comprueba que ya no estén y borra $pending_offsite."
+}
+
+# Sin rotación pendiente: comprueba que las claves anotadas ya no estén en el repositorio externo.
+check_pending_offsite() {
+  local ids id left=()
+  offsite_configured || die "Hay claves anotadas en $pending_offsite pero no hay repositorio externo configurado."
+  prepare_backup_perms
+  ids="$(backup_ops key-ids offsite | tr -d '\r')" || die "No se pudieron listar las claves del repositorio externo."
+  while read -r id; do
+    [[ -n "$id" ]] || continue
+    if grep -qxF "$id" <<<"$ids"; then left+=("$id"); fi
+  done < "$pending_offsite"
+  if (( ${#left[@]} > 0 )); then
+    printf '%s\n' "${left[@]}" > "$pending_offsite"
+    explain_pending_offsite
+    die "La contraseña anterior de restic todavía abre el repositorio externo."
+  fi
+  rm -f "$pending_offsite"
+  info "Las claves anteriores ya no están en el repositorio externo: rotación de restic terminada."
+}
+
 confirm_restic() {
-  local prev="$SECRETS_DIR/restic_password.previous" repos r oldmount
-  [[ -s "$prev" ]] || die "No hay una rotación de restic pendiente de confirmar."
+  local prev="$SECRETS_DIR/restic_password.previous" repos r oldmount id
+  if [[ ! -s "$prev" ]]; then
+    [[ -s "$pending_offsite" ]] || die "No hay una rotación de restic pendiente de confirmar."
+    check_pending_offsite
+    return 0
+  fi
   mapfile -t repos < <(restic_repos)
   confirm_word GUARDADA "Se quitará la contraseña ANTERIOR de restic de: ${repos[*]}. Solo la nueva ($SECRETS_DIR/restic_password) abrirá los backups."
   prepare_backup_perms
   oldmount="$(realpath "$prev"):/run/alvarez/old_password:ro"
-  for r in "${repos[@]}"; do backup_ops -v "$oldmount" -- key-remove-for "$r" /run/alvarez/old_password; done
+  for r in "${repos[@]}"; do
+    if [[ "$r" == offsite ]] && offsite_append_only; then
+      id="$(backup_ops -v "$oldmount" -- key-id offsite /run/alvarez/old_password | tr -d '\r')"
+      if [[ -n "$id" ]]; then
+        grep -qxF "$id" "$pending_offsite" 2>/dev/null || echo "$id" >> "$pending_offsite"
+        chmod 600 "$pending_offsite"
+      fi
+      continue
+    fi
+    backup_ops -v "$oldmount" -- key-remove-for "$r" /run/alvarez/old_password
+  done
   rm -f "$prev"
-  info "Rotación de restic terminada: solo la contraseña nueva abre los repositorios."
+  if [[ -s "$pending_offsite" ]]; then
+    info "Contraseña anterior quitada del repositorio local; en el externo queda hasta que la quites desde otra máquina."
+    explain_pending_offsite
+  else
+    info "Rotación de restic terminada: solo la contraseña nueva abre los repositorios."
+  fi
 }
 
 restart_api=0

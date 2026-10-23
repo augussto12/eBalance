@@ -4,6 +4,9 @@
 # está en .env (credenciales en SECRETS_DIR/restic-offsite.env). Programado a diario por alvarez-backup.timer.
 #   BACKUP_NO_PRUNE=1    no borra instantáneas locales (backup de seguridad antes de restaurar)
 #   BACKUP_LOCAL_ONLY=1  no copia al repositorio externo (lo usa restore.sh: una caída del destino no frena la restauración)
+#   BACKUP_SKIP_KEYRING=1 no respalda el key ring (lo usa restore.sh: el volumen de claves puede estar vacío o roto)
+# Si el volumen de claves está vacío (key ring perdido), respalda la base, la configuración y la copia externa, pero NO
+# el key ring, y termina con error: así una instantánea vacía nunca pasa a ser la «última» del key ring.
 #   backup.sh --verify-offsite   solo verifica que el último dump del repositorio externo se lea y sea igual al local
 # Correr como root (sudo): ajusta los permisos que necesita el contenedor de backup, que corre sin root.
 source "$(dirname "$0")/lib.sh"
@@ -16,7 +19,16 @@ if [[ "${1:-}" == --verify-offsite ]]; then
   exit 0
 fi
 dc --profile ops run --rm -T backup init </dev/null
-dc --profile ops run --rm -T -e BACKUP_NO_PRUNE="${BACKUP_NO_PRUNE:-0}" backup backup </dev/null
+keyring=OK
+[[ "${BACKUP_SKIP_KEYRING:-0}" != 1 ]] || keyring=omitido
+rc=0
+dc --profile ops run --rm -T -e BACKUP_NO_PRUNE="${BACKUP_NO_PRUNE:-0}" -e BACKUP_SKIP_KEYRING="${BACKUP_SKIP_KEYRING:-0}" \
+  backup backup </dev/null || rc=$?
+case "$rc" in
+  0) ;;
+  3) keyring=FALTA ;;   # la base quedó respaldada; el key ring no (/keys sin claves): se sigue y se falla al final
+  *) die "Falló el backup (pg_dump o restic, código $rc). Ver journalctl -u alvarez-backup." ;;
+esac
 
 # Configuración NO secreta para reconstruir el servidor: .env, sitio de Nginx instalado, unidades systemd y versión.
 # Los secretos (SECRETS_DIR) no van acá: se guardan fuera del servidor (RUNBOOK §4).
@@ -50,5 +62,6 @@ elif offsite_configured; then
 else
   warn "Sin copia fuera de la VPS (OFFSITE_RESTIC_REPOSITORY vacío): el único backup está en este servidor. Ver RUNBOOK §4."
 fi
-echo "$(date -u +%FT%TZ) backup OK offsite=$offsite" >> "$BACKUP_DIR/backup.log"
+echo "$(date -u +%FT%TZ) backup OK offsite=$offsite keyring=$keyring" >> "$BACKUP_DIR/backup.log"
+[[ "$keyring" != FALTA ]] || die "El volumen de claves está vacío: se respaldó la base, pero NO el key ring. Si la API no arranca («Key ring rechazado»), restaurá solo las claves con restore.sh --keyring-only (RUNBOOK §5)."
 [[ "$offsite" != FALLA ]] || die "Falló la copia al repositorio externo (el backup local quedó bien). Ver journalctl -u alvarez-backup."
