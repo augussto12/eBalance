@@ -701,6 +701,8 @@ function Trash() {
     <section className="panel span" id="papelera">
       <h2>Papelera</h2>
       <p>Los registros eliminados se pueden restaurar.</p>
+      {/* Tras un 409 al restaurar se recarga para tener la versión nueva: si esa recarga falla, se avisa. */}
+      {trash.data && <RefetchError error={trash.error} retrying={trash.isFetching} onRetry={() => trash.refetch()} />}
       {trash.data ? (trash.data.length === 0 ? <div className="empty">La papelera está vacía.</div> : trash.data.map((t) => (
         <div className="kv" key={`${t.type}-${t.id}`}>
           <span>{t.concept}<small> · {formatDate(t.date)} · eliminado {formatDateTime(t.deletedAt)}</small></span>

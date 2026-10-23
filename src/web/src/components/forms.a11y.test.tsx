@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { LoginPage } from '../auth/AuthPages';
 import { mapFieldErrors, type FieldErrors } from '../lib/forms';
+import { PAYMENT_FIELD_MAP, PaymentDialog } from '../pages/PlansPage';
 import { SettingsPage } from '../pages/SettingsPage';
 import { danglingDescribedBy, render, seed, testClient, TEST_ME, text } from '../test/render';
 import { PasswordField } from './PasswordField';
@@ -69,6 +70,39 @@ describe('formulario de registro: cada error junto a su campo', () => {
 
   it('sin errores no hay aria-invalid ni aria-describedby', () => {
     const html = render(<RecordFormBody initial={loanWithEverything} onClose={() => {}} />);
+    expect(html).not.toContain('aria-invalid');
+    expect(html).not.toContain('aria-describedby');
+  });
+});
+
+describe('registrar pago: cada error junto a su campo', () => {
+  /** Claves de validación de POST /payments (CashEndpoints.CreatePayment). */
+  const PAYMENT_SERVER_KEYS = ['sourceAccountId', 'targetAccountId', 'planId', 'amountMinor', 'date', 'currency', 'note', 'idempotencyKey', 'allocations', 'allocations[0].amountMinor'];
+
+  it('fecha, cuenta, destino e importe van a su campo; el resto (idempotencia, asignaciones, moneda, nota) al mensaje general', () => {
+    const server = Object.fromEntries(PAYMENT_SERVER_KEYS.map((k) => [k, [`srv ${k}`]]));
+    const { fields, other } = mapFieldErrors(server, PAYMENT_FIELD_MAP);
+    expect(fields).toEqual({ source: ['srv sourceAccountId'], target: ['srv targetAccountId', 'srv planId'], amount: ['srv amountMinor'], date: ['srv date'] });
+    expect(other).toEqual(['srv currency', 'srv note', 'srv idempotencyKey', 'srv allocations', 'srv allocations[0].amountMinor']);
+  });
+
+  it('cada campo muestra su mensaje, con aria-invalid y aria-describedby a un elemento existente (también la fecha)', () => {
+    const fields = ['target', 'source', 'amount', 'date'] as const;
+    const html = render(
+      <PaymentDialog kind="card" currency="ARS" target={{}} plans={[]} onClose={() => {}} initialErrors={Object.fromEntries(fields.map((f) => [f, [`Mensaje de ${f}.`]]))} />,
+    );
+    expect(danglingDescribedBy(html)).toEqual([]);
+    for (const f of fields) {
+      const id = new RegExp(`<span class="fielderror" id="([^"]+)" role="alert">Mensaje de ${f}\\.</span>`).exec(html)?.[1];
+      expect(id, `sin mensaje junto al campo ${f}`).toBeTruthy();
+      expect(html, `ningún control describe el error de ${f}`).toMatch(new RegExp(`aria-invalid="true" aria-describedby="${id}"`));
+    }
+    expect(html).toMatch(/<input type="date"[^>]*aria-invalid="true"/);
+  });
+
+  it('sin errores no hay aria-invalid ni aria-describedby', () => {
+    const html = render(<PaymentDialog kind="card" currency="ARS" target={{}} plans={[]} onClose={() => {}} />);
+    expect(html).toContain('Registrar pago');
     expect(html).not.toContain('aria-invalid');
     expect(html).not.toContain('aria-describedby');
   });
