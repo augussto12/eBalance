@@ -4,6 +4,7 @@ using AlvarezFinanzas.Infrastructure;
 using AlvarezFinanzas.Infrastructure.Auth;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
 using Xunit;
 
 namespace AlvarezFinanzas.IntegrationTests;
@@ -71,6 +72,8 @@ public class KeyRingTests(PostgresFixture pg)
         // Volumen de claves perdido (Docker lo recrea vacío). Producción no permite desactivar la verificación.
         ring.Lose();
         var refused = AssertRefusesToStart(cs, ring, ring.Settings(new Dictionary<string, string> { ["App:VerifyKeyRingAtStartup"] = "false" }));
+        // Solo se perdieron las claves: restaurar solo el volumen de claves, sin volver la base atrás.
+        Assert.Contains("./infra/scripts/restore.sh --keyring-only", refused.Message);
         Assert.Contains("--with-keyring", refused.Message);
         Assert.Empty(ring.KeyFiles());
 
@@ -145,6 +148,88 @@ public class KeyRingTests(PostgresFixture pg)
         Assert.Contains("secretos TOTP", AssertRefusesToStart(cs, ring).Message);
         Assert.Empty(ring.KeyFiles());
         await using (var db = Db(cs)) Assert.Null(await db.KeyRingSentinels.SingleOrDefaultAsync());
+    }
+
+    /// <summary>
+    /// Dump anterior al centinela restaurado sin su key ring (o en otra VPS): la API no arranca y reset-key-ring tiene que
+    /// poder aceptar la pérdida. Antes respondía «No hay nada que reiniciar» y la API seguía sin arrancar.
+    /// </summary>
+    [Fact]
+    public async Task Reset_key_ring_also_recovers_a_database_without_sentinel_whose_totp_secrets_do_not_decrypt()
+    {
+        using var ring = new TestKeyRing();
+        var cs = await MigratedDatabaseAsync();
+        await using (var app = StartProduction(cs, ring)) await app.SignedInAsync("augusto", Password);
+        await using (var db = Db(cs)) await db.KeyRingSentinels.ExecuteDeleteAsync();
+        ring.Lose();
+        Assert.Contains("secretos TOTP", AssertRefusesToStart(cs, ring).Message);
+
+        var reset = await CliRunner.RunAsync("reset-key-ring", cs, ring.KeysPath, ring, input: Cli.ResetKeyRingConfirmation + "\n");
+        Assert.True(reset.Code == 0, reset.Output);
+        Assert.Contains("no hay centinela y 1 de 1 secretos TOTP", reset.Output);
+        Assert.Contains("--keyring-only", reset.Output);
+        Assert.Contains("Segundos factores reiniciados: 1", reset.Output);
+        Assert.Contains("system.key_ring.sentinel:reset", await AuditAsync(cs));
+
+        await using var restarted = StartProduction(cs, ring);
+        var c = restarted.NewClient();
+        Assert.Equal("enroll_required", (await (await c.LoginAsync("augusto", Password)).Json()).Str("state"));
+        var again = await CliRunner.RunAsync("reset-key-ring", cs, ring.KeysPath, ring);
+        Assert.Contains("No hay nada que reiniciar", again.Output);
+    }
+
+    /// <summary>
+    /// rotate-secrets.sh keyring-cert y después una clave nueva (cifrada con el certificado nuevo) pasa a ser la de por
+    /// defecto: el arranque siguiente vuelve a proteger el centinela y el TOTP con ella, así que borrar el certificado
+    /// anterior (o restaurar en otra VPS solo con el actual) ya no impide arrancar ni pide reiniciar el segundo factor.
+    /// </summary>
+    [Fact]
+    public async Task After_a_certificate_rotation_the_sentinel_and_totp_move_to_the_current_key_so_the_old_certificate_is_not_needed()
+    {
+        using var ring = new TestKeyRing();
+        var cs = await MigratedDatabaseAsync();
+        string totpSecret;
+        await using (var first = StartProduction(cs, ring)) totpSecret = (await first.SignedInAsync("augusto", Password)).TotpSecret;
+        string sentinelBefore, totpBefore;
+        await using (var db = Db(cs))
+        {
+            sentinelBefore = (await db.KeyRingSentinels.SingleAsync()).ProtectedValue;
+            totpBefore = (await db.Users.SingleAsync()).TotpSecretProtected!;
+        }
+        var firstKeys = ring.KeyFiles();
+
+        // Sin claves nuevas, reiniciar no cambia nada (no se generan claves ni se reescriben filas).
+        await using (StartProduction(cs, ring)) { }
+        Assert.Equal(firstKeys, ring.KeyFiles());
+        await using (var db = Db(cs)) Assert.Equal(sentinelBefore, (await db.KeyRingSentinels.SingleAsync()).ProtectedValue);
+
+        ring.RotateCertificate();
+        await using (var rotated = StartProduction(cs, ring))
+        {
+            // Lo que Data Protection hace solo cuando vence la clave por defecto: una clave nueva, cifrada con el certificado nuevo.
+            var keys = rotated.Services.GetRequiredService<Microsoft.AspNetCore.DataProtection.KeyManagement.IKeyManager>();
+            // Activación posterior a la de la primera clave: pasa a ser la de por defecto.
+            var now = DateTimeOffset.UtcNow;
+            keys.CreateNewKey(now, now.AddDays(90));
+        }
+        await using (StartProduction(cs, ring)) { }
+        await using (var db = Db(cs))
+        {
+            Assert.NotEqual(sentinelBefore, (await db.KeyRingSentinels.SingleAsync()).ProtectedValue);
+            Assert.NotEqual(totpBefore, (await db.Users.SingleAsync()).TotpSecretProtected);
+        }
+        Assert.Contains("system.key_ring.reprotect:success", await AuditAsync(cs));
+
+        ring.DropPreviousCertificates();
+        await using var withoutPrevious = StartProduction(cs, ring);
+        withoutPrevious.Clock.Advance(TimeSpan.FromHours(1));
+        var c = withoutPrevious.NewClient();
+        c.TotpSecret = totpSecret;
+        Assert.Equal("mfa_required", (await (await c.LoginAsync("augusto", Password)).Json()).Str("state"));
+        Assert.Equal(HttpStatusCode.OK, (await c.PostAsync("/api/v1/auth/mfa/verify", new { code = c.NextCode() })).StatusCode);
+        var verified = await CliRunner.RunAsync("verify-data", cs, ring.KeysPath, ring);
+        Assert.True(verified.Code == 0, verified.Output);
+        Assert.Contains("\"keyRingSentinel\": \"Verified\"", verified.Output);
     }
 
     [Fact]

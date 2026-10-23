@@ -16,12 +16,36 @@ public sealed class TestKeyRing : IDisposable
     {
         Directory.CreateDirectory(KeysPath);
         Directory.CreateDirectory(Path.GetDirectoryName(CertificatePath)!);
+        WriteNewCertificate();
+    }
+
+    private void WriteNewCertificate()
+    {
         using var rsa = RSA.Create(2048);
         var request = new CertificateRequest("CN=alvarez-finanzas-keyring-tests", rsa, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
         using var cert = request.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddYears(1));
         var password = Convert.ToHexString(RandomNumberGenerator.GetBytes(16));
         File.WriteAllBytes(CertificatePath, cert.Export(X509ContentType.Pfx, password));
         File.WriteAllText(PasswordPath, password);
+    }
+
+    /// <summary>
+    /// Lo mismo que rotate-secrets.sh keyring-cert: el certificado actual pasa a previous-*.pfx (con su .password) y se
+    /// instala uno nuevo. Las claves nuevas se cifran con el nuevo; las viejas siguen necesitando el anterior.
+    /// </summary>
+    public void RotateCertificate()
+    {
+        var stamp = DateTime.UtcNow.ToString("yyyyMMddHHmmssfff", System.Globalization.CultureInfo.InvariantCulture);
+        var dir = Path.GetDirectoryName(CertificatePath)!;
+        File.Move(CertificatePath, Path.Combine(dir, $"previous-{stamp}.pfx"));
+        File.Move(PasswordPath, Path.Combine(dir, $"previous-{stamp}.password"));
+        WriteNewCertificate();
+    }
+
+    /// <summary>Borra los certificados anteriores (o restaura en otra VPS solo con el certificado actual).</summary>
+    public void DropPreviousCertificates()
+    {
+        foreach (var f in Directory.GetFiles(Path.GetDirectoryName(CertificatePath)!, "previous-*")) File.Delete(f);
     }
 
     public string KeysPath => Path.Combine(_root, "keys");

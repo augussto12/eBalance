@@ -106,9 +106,7 @@ public sealed record KeyRingReport(KeyRingStatus Status, string Detail, int Totp
 /// <summary>La API no arranca: el key ring no corresponde a la base.</summary>
 public sealed class KeyRingMismatchException(string detail) : InvalidOperationException(
     $"Data Protection: el key ring no corresponde a esta base ({detail}). La API no arranca para no generar claves nuevas " +
-    "en silencio: los segundos factores y las sesiones guardadas no se podrían descifrar. Restaurá el volumen de claves " +
-    "(restore.sh <instantánea> --with-keyring) o, si se perdió definitivamente, aceptá la pérdida con reset-key-ring.sh " +
-    "(reinicia el segundo factor y revoca las sesiones).");
+    "en silencio: los segundos factores y las sesiones guardadas no se podrían descifrar. " + KeyRingGuard.RecoveryHint);
 
 /// <summary>
 /// Falla cerrado si se pierde o reemplaza el key ring (docs/04: «no generar silenciosamente claves nuevas al perder volumen»).
@@ -129,6 +127,29 @@ public sealed class KeyRingGuard(
     public const string Purpose = "AlvarezFinanzas.KeyRingSentinel.v1";
     public const string ExpectedValue = "alvarez-finanzas:key-ring-sentinel:v1";
 
+    /// <summary>Qué hacer si la API no arranca por el key ring (lo muestran el error de arranque y reset-key-ring).</summary>
+    public const string RecoveryHint =
+        "Si solo se perdió o se reemplazó el volumen de claves, restauralo sin tocar la base con " +
+        "./infra/scripts/restore.sh --keyring-only. Si se perdieron la base y las claves, restaurá ambas con " +
+        "./infra/scripts/restore.sh <instantánea> --with-keyring. Si no hay copia del key ring, aceptá la pérdida con " +
+        "reset-key-ring.sh (reinicia el segundo factor y revoca las sesiones).";
+
+    /// <summary>
+    /// Regla única de «la API no arranca», para el arranque y para reset-key-ring: el centinela o algún secreto TOTP no se
+    /// descifra, o todavía no hay centinela y algún secreto TOTP existente no se descifra (no se adopta un key ring que no
+    /// corresponde a la base). En ese último caso el estado efectivo es Mismatch.
+    /// </summary>
+    public static KeyRingReport Effective(KeyRingReport report) =>
+        report.Status == KeyRingStatus.Missing && report.TotpDecryptable < report.TotpSecrets
+            ? report with
+            {
+                Status = KeyRingStatus.Mismatch,
+                Detail = $"no hay centinela y {report.TotpSecrets - report.TotpDecryptable} de {report.TotpSecrets} secretos TOTP no se pueden descifrar",
+            }
+            : report;
+
+    public static bool RefusesStart(KeyRingReport report) => Effective(report).Status == KeyRingStatus.Mismatch;
+
     /// <summary>En producción no se puede desactivar.</summary>
     public bool Enabled => env.IsProduction() || options.Value.VerifyKeyRingAtStartup;
 
@@ -148,6 +169,7 @@ public sealed class KeyRingGuard(
             throw new KeyRingMismatchException(report.Detail);
         }
         logger.LogInformation("Key ring verificado ({Status}).", report.Status);
+        await RefreshAsync(db, cancellationToken);
     }
 
     public Task StartAsync(CancellationToken cancellationToken) => Task.CompletedTask;
@@ -188,16 +210,8 @@ public sealed class KeyRingGuard(
     /// </summary>
     public async Task<KeyRingReport> EnsureAsync(AppDbContext db, CancellationToken ct = default)
     {
-        var report = await VerifyAsync(db, ct);
+        var report = Effective(await VerifyAsync(db, ct));
         if (report.Status != KeyRingStatus.Missing) return report;
-        if (report.TotpDecryptable < report.TotpSecrets)
-        {
-            return report with
-            {
-                Status = KeyRingStatus.Mismatch,
-                Detail = $"no hay centinela y {report.TotpSecrets - report.TotpDecryptable} de {report.TotpSecrets} secretos TOTP no se pueden descifrar",
-            };
-        }
         var adopted = report.TotpSecrets > 0;
         try
         {
@@ -232,6 +246,82 @@ public sealed class KeyRingGuard(
         db.AuditEvents.Add(new AuditEvent { Action = "system.key_ring.sentinel", Result = result, OccurredAt = now });
         await db.SaveChangesAsync(ct);
     }
+
+    /// <summary>
+    /// Después de un arranque verificado: vuelve a proteger con la clave por defecto actual el centinela y los secretos
+    /// TOTP que siguen protegidos con una clave anterior. Data Protection nunca vuelve a cifrar datos viejos: sin esto, el
+    /// centinela de la primera ejecución (y el TOTP enrolado entonces) dependerían para siempre de la primera clave y de su
+    /// certificado, y borrar un previous-*.pfx (o restaurar en otra VPS solo con el certificado actual) impediría arrancar.
+    /// Cuando una clave nueva (cifrada con el certificado nuevo) pasa a ser la de por defecto, el arranque siguiente los
+    /// actualiza. Las claves viejas siguen en el key ring (no se revocan). Seguro: cada valor nuevo se comprueba con el key
+    /// ring de solo lectura leído del disco (la clave está persistida y cifrada con un certificado configurado) antes de
+    /// guardarlo, y la fila solo cambia si nadie la cambió antes. Si algo falla, no se toca nada y la API arranca igual.
+    /// </summary>
+    public async Task<int> RefreshAsync(AppDbContext db, CancellationToken ct = default)
+    {
+        try
+        {
+            var refreshed = 0;
+            var sentinelProtector = dataProtection.CreateProtector(Purpose);
+            var fresh = sentinelProtector.Protect(ExpectedValue);
+            var current = KeyIdOf(fresh);
+            if (current is null) return 0;
+            var sentinel = await db.KeyRingSentinels.AsNoTracking().SingleOrDefaultAsync(ct);
+            if (sentinel is not null && !SameKey(KeyIdOf(sentinel.ProtectedValue), current)
+                && TryUnprotect(readOnly.Provider.CreateProtector(Purpose), fresh, out var check) is null && check == ExpectedValue)
+            {
+                refreshed += await db.KeyRingSentinels.Where(x => x.Id == sentinel.Id && x.ProtectedValue == sentinel.ProtectedValue)
+                    .ExecuteUpdateAsync(u => u.SetProperty(x => x.ProtectedValue, fresh), ct);
+            }
+
+            var totpProtector = dataProtection.CreateProtector(TotpService.Purpose);
+            var totpReader = readOnly.Provider.CreateProtector(TotpService.Purpose);
+            var users = await db.Users.AsNoTracking().Where(u => u.TotpSecretProtected != null)
+                .Select(u => new { u.Id, Secret = u.TotpSecretProtected! }).ToListAsync(ct);
+            foreach (var user in users.Where(u => !SameKey(KeyIdOf(u.Secret), current)))
+            {
+                if (TryUnprotect(totpReader, user.Secret, out var plain) is not null || plain is null) continue;
+                var again = totpProtector.Protect(plain);
+                if (TryUnprotect(totpReader, again, out var roundTrip) is not null || roundTrip != plain) continue;
+                refreshed += await db.Users.Where(u => u.Id == user.Id && u.TotpSecretProtected == user.Secret)
+                    .ExecuteUpdateAsync(u => u.SetProperty(x => x.TotpSecretProtected, again), ct);
+            }
+            if (refreshed > 0)
+            {
+                db.AuditEvents.Add(new AuditEvent { Action = "system.key_ring.reprotect", Result = "success", OccurredAt = clock.GetUtcNow() });
+                await db.SaveChangesAsync(ct);
+                logger.LogInformation("Datos protegidos con una clave anterior vueltos a proteger con la clave actual: {Count}.", refreshed);
+            }
+            return refreshed;
+        }
+        catch (Exception ex) when (ex is CryptographicException or InvalidOperationException or IOException or DbUpdateException or Npgsql.NpgsqlException)
+        {
+            logger.LogWarning(ex, "No se pudieron volver a proteger el centinela y los secretos TOTP con la clave actual; se reintenta en el próximo arranque.");
+            return 0;
+        }
+    }
+
+    /// <summary>
+    /// Identificador de la clave con la que se protegió un valor: el payload de Data Protection es Base64url de
+    /// [encabezado mágico de 4 bytes][id de la clave, 16 bytes][…]. Null si el valor no tiene ese formato.
+    /// </summary>
+    internal static byte[]? KeyIdOf(string payload)
+    {
+        byte[] bytes;
+        try
+        {
+            bytes = System.Buffers.Text.Base64Url.DecodeFromChars(payload);
+        }
+        catch (FormatException)
+        {
+            return null;
+        }
+        return bytes.Length >= 20 && bytes.AsSpan(0, 4).SequenceEqual(PayloadMagicHeader) ? bytes[4..20] : null;
+    }
+
+    private static ReadOnlySpan<byte> PayloadMagicHeader => [0x09, 0xF0, 0xC9, 0xF0];
+
+    private static bool SameKey(byte[]? a, byte[]? b) => a is not null && b is not null && a.AsSpan().SequenceEqual(b);
 
     /// <summary>Descifra un secreto TOTP con el key ring de solo lectura (no crea claves).</summary>
     public bool CanDecryptTotp(string protectedSecret) =>
