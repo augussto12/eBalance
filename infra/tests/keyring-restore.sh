@@ -83,7 +83,9 @@ ok "backup.sh con /keys vacío: base respaldada, key ring no, sale con error y r
 info "restore.sh --keyring-only"
 printf 'CLAVES\n' | "$ROOT/infra/scripts/restore.sh" --keyring-only >"$tmp/restore.log" 2>&1 || { tail -40 "$tmp/restore.log"; fail "restore.sh --keyring-only"; }
 grep -q "Key ring $good restaurado sin tocar la base" "$tmp/restore.log" || { tail -20 "$tmp/restore.log"; fail "restore.sh no restauró $good"; }
-grep -q 'keys-reemplazadas' "$tmp/restore.log" && fail "con el volumen vacío no debería guardar claves reemplazadas"
+if grep -q 'quedó en .*keys-reemplazadas' "$tmp/restore.log" || compgen -G "$BACKUP_DIR/keys-reemplazadas-*.tar" >/dev/null; then
+  fail "con el volumen vacío no debería guardar claves reemplazadas"
+fi
 [[ "$(key_names)" == "$orig_keys" ]] || fail "las claves restauradas no son las originales"
 wait_healthy api; wait_healthy web
 [[ "$(psql_admin -c "SELECT count(*) FROM $schema.marca WHERE t = 'después del backup'")" == 1 ]] \
