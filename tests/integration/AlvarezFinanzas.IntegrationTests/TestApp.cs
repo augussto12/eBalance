@@ -40,19 +40,25 @@ public sealed class PostgresFixture : IAsyncLifetime
     }
 }
 
-public sealed class TestApp(string connectionString, IDictionary<string, string>? settings = null) : WebApplicationFactory<Program>
+/// <param name="keyRingPath">Key ring compartido entre arranques (reinicios, pérdida simulada). Si es null, uno temporal propio.</param>
+public sealed class TestApp(string connectionString, IDictionary<string, string>? settings = null, string environment = "Testing",
+    string? keyRingPath = null) : WebApplicationFactory<Program>
 {
     public const string Origin = "https://localhost";
     public FakeTimeProvider Clock { get; } = new(DateTimeOffset.UtcNow);
-    private readonly string _keys = Path.Combine(Path.GetTempPath(), "alvarez-keys-" + Guid.NewGuid().ToString("N"));
+    public string ConnectionString { get; } = connectionString;
+    public string KeyRingPath { get; } = keyRingPath ?? Path.Combine(Path.GetTempPath(), "alvarez-keys-" + Guid.NewGuid().ToString("N"));
+    private readonly bool _ownsKeyRing = keyRingPath is null;
 
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
-        builder.UseEnvironment("Testing");
-        builder.UseSetting("ConnectionStrings:App", connectionString);
+        builder.UseEnvironment(environment);
+        builder.UseSetting("ConnectionStrings:App", ConnectionString);
         builder.UseSetting("App:PublicOrigin", Origin);
         builder.UseSetting("App:DataProtectionApplicationName", "alvarez-finanzas-tests");
-        builder.UseSetting("App:KeyRingPath", _keys);
+        builder.UseSetting("App:KeyRingPath", KeyRingPath);
+        // Toda prueba arranca con la verificación del centinela del key ring (en producción es obligatoria).
+        builder.UseSetting("App:VerifyKeyRingAtStartup", "true");
         foreach (var (k, v) in settings ?? new Dictionary<string, string>()) builder.UseSetting(k, v);
         builder.ConfigureServices(s =>
         {
@@ -63,11 +69,43 @@ public sealed class TestApp(string connectionString, IDictionary<string, string>
 
     public static async Task<TestApp> StartAsync(PostgresFixture pg, IDictionary<string, string>? settings = null)
     {
-        var app = new TestApp(await pg.CreateDatabaseAsync(), settings);
-        using var scope = app.Services.CreateScope();
-        await scope.ServiceProvider.GetRequiredService<AppDbContext>().Database.MigrateAsync();
+        var connectionString = await pg.CreateDatabaseAsync();
+        await MigrateAsync(connectionString);
+        return Start(connectionString, settings);
+    }
+
+    /// <summary>Migraciones ANTES de arrancar la API, como en producción (migrate y después up).</summary>
+    public static async Task MigrateAsync(string connectionString)
+    {
+        await using var db = new AppDbContext(DbOptions(connectionString), TimeProvider.System);
+        await db.Database.MigrateAsync();
+    }
+
+    /// <summary>Arranca la API sobre una base ya migrada (p. ej. un reinicio con el mismo key ring u otro).</summary>
+    public static TestApp Start(string connectionString, IDictionary<string, string>? settings = null, string environment = "Testing", string? keyRingPath = null)
+    {
+        var app = new TestApp(connectionString, settings, environment, keyRingPath);
+        try
+        {
+            _ = app.Services;
+        }
+        catch
+        {
+            app.Dispose();
+            throw;
+        }
         return app;
     }
+
+    public static DbContextOptions<AppDbContext> DbOptions(string connectionString) =>
+        new DbContextOptionsBuilder<AppDbContext>().UseNpgsql(connectionString).UseSnakeCaseNamingConvention().Options;
+
+    /// <summary>
+    /// Contexto fuera de un request. Sin propietario se comporta como la CLI: los datos financieros exigen
+    /// IgnoreQueryFilters explícito. Con propietario, como un request de ese usuario.
+    /// </summary>
+    public AppDbContext NewDbContext(Guid? owner = null) =>
+        new(DbOptions(ConnectionString), Clock, owner is { } id ? new FixedOwner(id) : null);
 
     public async Task CreateUserAsync(string username, string password)
     {
@@ -103,8 +141,14 @@ public sealed class TestApp(string connectionString, IDictionary<string, string>
     protected override void Dispose(bool disposing)
     {
         base.Dispose(disposing);
-        try { Directory.Delete(_keys, true); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+        if (!_ownsKeyRing) return;
+        try { Directory.Delete(KeyRingPath, true); } catch (IOException) { } catch (UnauthorizedAccessException) { }
     }
+}
+
+public sealed class FixedOwner(Guid ownerId) : ICurrentOwner
+{
+    public Guid? OwnerId => ownerId;
 }
 
 public sealed class Client(TestApp app, HttpClient http, CookieContainer cookies)

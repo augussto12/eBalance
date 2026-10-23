@@ -6,9 +6,24 @@ using Microsoft.EntityFrameworkCore.Metadata.Builders;
 
 namespace AlvarezFinanzas.Infrastructure;
 
-public sealed class AppDbContext(DbContextOptions<AppDbContext> options, TimeProvider clock)
+/// <param name="owner">
+/// Propietario para los filtros globales por owner_id. Sin él (CLI, migraciones, procesos en segundo plano) cualquier
+/// consulta de datos financieros falla, salvo que use explícitamente <c>IgnoreQueryFilters([OwnerFilter])</c>.
+/// </param>
+public sealed class AppDbContext(DbContextOptions<AppDbContext> options, TimeProvider clock, ICurrentOwner? owner = null)
     : IdentityDbContext<AppUser, IdentityRole<Guid>, Guid>(options)
 {
+    /// <summary>
+    /// Nombre del filtro global por propietario: defensa adicional, no la única autorización (cada consulta sigue filtrando
+    /// por el owner de la sesión). Ignorarlo solo en procesos operativos que recorren todos los propietarios.
+    /// </summary>
+    public const string OwnerFilter = "owner";
+
+    /// <summary>Lo evalúa EF en cada consulta (no queda fijo en el modelo cacheado).</summary>
+    private Guid CurrentOwnerId => owner?.OwnerId ?? throw new InvalidOperationException(
+        "Consulta de datos financieros sin un propietario con sesión completa. Los procesos operativos que recorren " +
+        "todos los propietarios deben usar IgnoreQueryFilters([AppDbContext.OwnerFilter]) de forma explícita.");
+
     public DbSet<Account> Accounts => Set<Account>();
     public DbSet<Category> Categories => Set<Category>();
     public DbSet<Entry> Entries => Set<Entry>();
@@ -22,6 +37,7 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options, TimePro
     public DbSet<AuditEvent> AuditEvents => Set<AuditEvent>();
     public DbSet<UserSession> Sessions => Set<UserSession>();
     public DbSet<RecoveryCode> RecoveryCodes => Set<RecoveryCode>();
+    public DbSet<KeyRingSentinel> KeyRingSentinels => Set<KeyRingSentinel>();
 
     protected override void OnModelCreating(ModelBuilder b)
     {
@@ -101,9 +117,11 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options, TimePro
 
         b.Entity<Installment>(e =>
         {
+            e.HasQueryFilter(OwnerFilter, x => x.OwnerId == CurrentOwnerId);
             e.HasKey(x => x.Id);
             e.HasAlternateKey(x => new { x.OwnerId, x.Id });
             e.Property(x => x.Version).IsConcurrencyToken();
+            RollbackSafeStamps(e);
             e.HasOne(x => x.Plan).WithMany(p => p.Installments)
                 .HasForeignKey(x => new { x.OwnerId, x.PlanId })
                 .HasPrincipalKey(p => new { p.OwnerId, p.Id })
@@ -131,7 +149,10 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options, TimePro
 
         b.Entity<PaymentAllocation>(e =>
         {
+            e.HasQueryFilter(OwnerFilter, x => x.OwnerId == CurrentOwnerId);
             e.HasKey(x => x.Id);
+            e.Property(x => x.Version).IsConcurrencyToken().HasDefaultValue(1L);
+            RollbackSafeStamps(e);
             e.HasOne(x => x.Payment).WithMany(p => p.Allocations)
                 .HasForeignKey(x => new { x.OwnerId, x.PaymentId })
                 .HasPrincipalKey(p => new { p.OwnerId, p.Id })
@@ -164,6 +185,7 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options, TimePro
 
         b.Entity<ImportBatch>(e =>
         {
+            e.HasQueryFilter(OwnerFilter, x => x.OwnerId == CurrentOwnerId);
             e.HasKey(x => x.Id);
             e.Property(x => x.Status).HasConversion<string>().HasMaxLength(16);
             e.Property(x => x.Format).HasMaxLength(32);
@@ -176,6 +198,7 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options, TimePro
 
         b.Entity<ImportedRecord>(e =>
         {
+            e.HasQueryFilter(OwnerFilter, x => x.OwnerId == CurrentOwnerId);
             e.HasKey(x => x.Id);
             e.Property(x => x.SourceType).HasMaxLength(32);
             e.Property(x => x.SourceId).HasMaxLength(100);
@@ -217,15 +240,34 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options, TimePro
             e.HasIndex(x => new { x.UserId, x.CodeHash }).IsUnique();
             e.HasOne<AppUser>().WithMany().HasForeignKey(x => x.UserId).OnDelete(DeleteBehavior.Cascade);
         });
+
+        b.Entity<KeyRingSentinel>(e =>
+        {
+            e.ToTable("key_ring_sentinel", t => t.HasCheckConstraint("ck_key_ring_sentinel_single", "id = 1"));
+            e.HasKey(x => x.Id);
+            e.Property(x => x.Id).ValueGeneratedNever();
+            e.Property(x => x.ProtectedValue).HasMaxLength(1000);
+        });
     }
 
-    private static void Owned<T>(EntityTypeBuilder<T> e) where T : OwnedEntity
+    private void Owned<T>(EntityTypeBuilder<T> e) where T : OwnedEntity
     {
+        e.HasQueryFilter(OwnerFilter, x => x.OwnerId == CurrentOwnerId);
         e.HasKey(x => x.Id);
         e.HasAlternateKey(x => new { x.OwnerId, x.Id });
         e.Property(x => x.Version).IsConcurrencyToken();
         e.HasOne<AppUser>().WithMany().HasForeignKey(x => x.OwnerId).OnDelete(DeleteBehavior.Restrict);
         e.HasIndex(x => new { x.OwnerId, x.DeletedAt });
+    }
+
+    /// <summary>
+    /// Columnas agregadas después de la primera versión: DEFAULT en la base solo como red para que la versión anterior
+    /// (rollback sin revertir migraciones, expand/contract) pueda seguir insertando. La app siempre las sella en SaveChangesAsync.
+    /// </summary>
+    private static void RollbackSafeStamps<T>(EntityTypeBuilder<T> e) where T : class, IStampedRecord
+    {
+        e.Property(x => x.CreatedAt).HasDefaultValueSql("now()");
+        e.Property(x => x.UpdatedAt).HasDefaultValueSql("now()");
     }
 
     /// <summary>FK compuesta (owner_id, id): impide relacionar registros de otro propietario a nivel de base.</summary>
@@ -236,10 +278,11 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options, TimePro
         rel.HasForeignKey(fk).HasPrincipalKey(p => new { p.OwnerId, p.Id }).OnDelete(DeleteBehavior.Restrict);
     }
 
+    /// <summary>Sella fechas (UTC) y versión de todo registro financiero (<see cref="IStampedRecord"/>): cuentas, movimientos, planes, cuotas, pagos, asignaciones y transferencias.</summary>
     public override Task<int> SaveChangesAsync(CancellationToken cancellationToken = default)
     {
         var now = clock.GetUtcNow();
-        foreach (var entry in ChangeTracker.Entries<OwnedEntity>())
+        foreach (var entry in ChangeTracker.Entries<IStampedRecord>())
         {
             if (entry.State == EntityState.Added)
             {
@@ -252,10 +295,6 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options, TimePro
                 entry.Entity.UpdatedAt = now;
                 entry.Entity.Version++;
             }
-        }
-        foreach (var entry in ChangeTracker.Entries<Installment>())
-        {
-            if (entry.State == EntityState.Modified) entry.Entity.Version++;
         }
         return base.SaveChangesAsync(cancellationToken);
     }

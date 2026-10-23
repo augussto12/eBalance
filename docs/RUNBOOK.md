@@ -117,6 +117,8 @@ systemctl list-timers 'alvarez-*'
 
 **Logs:** cada contenedor usa el driver `local` con rotación por tamaño (10 MB × 5). Eso limita el espacio, **no la antigüedad**. Para una retención estricta de 30 días, usá `logging.driver: journald` y en `/etc/systemd/journald.conf` poné `MaxRetentionSec=30day`. La API no registra cuerpos, cookies, tokens ni parámetros de consulta; Nginx registra rutas sin query string. Auditoría: tabla `audit_events`, 90 días.
 
+**Contraseñas:** PBKDF2-HMAC-SHA512 (formato v3 de Identity), 210.000 iteraciones y sal de 128 bits. Coste medido: unos 156–159 ms por verificación en 4 vCPU Intel Xeon a 2,1 GHz con .NET 10.0.13 (entorno de desarrollo, no la VPS). Cada login consume ese tiempo de CPU; el límite por IP se aplica antes de calcularlo. Para medirlo en una máquina con el SDK: `dotnet test --project tests/unit/AlvarezFinanzas.UnitTests --filter-class AlvarezFinanzas.UnitTests.PasswordHashingTests --output Detailed`. Si cambia la política, el hash se actualiza solo en el siguiente login correcto.
+
 ## 4. Backups
 
 - `backup.sh` genera un `pg_dump` consistente (rol migrador) más el key ring, cifrados por restic **antes** de escribir en `BACKUP_DIR`. Retención: últimas 10 + 7 diarios + 4 semanales + 3 mensuales. Al final ejecuta `restic check` sobre una muestra.
@@ -138,6 +140,11 @@ systemctl list-timers 'alvarez-*'
 - Usá `--with-keyring` solo si se perdió el volumen de claves.
 - Nunca se ejecuta automáticamente.
 
+**Key ring perdido o reemplazado (falla cerrada).** La primera vez que la API arranca con una base guarda en ella un centinela protegido con Data Protection. En cada arranque lo descifra, junto con los secretos TOTP, con el key ring actual y sin crear claves. Si no puede (volumen `keys` perdido o recreado vacío, key ring de otra instalación, certificado nuevo sin su `previous-*.pfx`), la API **no arranca** y el log muestra `Key ring rechazado: …`. `check-config` y `verify-data` también fallan, y ninguno de los tres genera claves nuevas.
+
+1. Con copia: `./infra/scripts/restore.sh <snapshot|latest> --with-keyring`.
+2. Sin copia posible: `./infra/scripts/reset-key-ring.sh`. Pide escribir `ACEPTAR-PERDIDA`, reinicia el segundo factor de los usuarios cuyo secreto ya no se puede descifrar, revoca todas las sesiones y registra un centinela nuevo. Queda auditado como `cli.reset_key_ring`. Los datos financieros no dependen del key ring. **[el comando `reset-key-ring` está probado; el script contra Compose, no]**
+
 RPO objetivo ≤ 24 h (backup diario). RTO objetivo ≤ 4 h: en el entorno local, restaurar llevó menos de un minuto con pocos datos. Medilo en la VPS.
 
 ## 6. Migraciones y rollback
@@ -158,6 +165,7 @@ No borres `previous-*.pfx` mientras existan claves o backups que lo necesiten (s
 ## 8. Recuperación de acceso
 
 - **Perdiste el celular, tenés códigos de recuperación:** en la pantalla del código, «Usar un código de recuperación». Esto cierra las demás sesiones. Después: Configuración → Seguridad → «Reconfigurar autenticador» y «Generar códigos nuevos».
+- **La API no arranca por el key ring:** ver «Key ring perdido o reemplazado» en la sección 5.
 - **Perdiste todo:** por SSH, `./infra/scripts/recover-owner.sh --username augusto`. Pide confirmar escribiendo el usuario, define una contraseña nueva (oculta), reinicia el segundo factor y revoca todas las sesiones. Queda auditado como `cli.recover_owner`. No existe recuperación pública por web.
 
 ## 9. Incidente (sospecha de acceso indebido)

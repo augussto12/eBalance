@@ -2,8 +2,19 @@ using Microsoft.AspNetCore.Identity;
 
 namespace AlvarezFinanzas.Domain;
 
+/// <summary>
+/// Fechas de alta/modificación (UTC) y versión optimista. Las sella <c>AppDbContext.SaveChangesAsync</c>: alta → versión 1,
+/// modificación → versión + 1. Nunca vienen del cliente.
+/// </summary>
+public interface IStampedRecord
+{
+    DateTimeOffset CreatedAt { get; set; }
+    DateTimeOffset UpdatedAt { get; set; }
+    long Version { get; set; }
+}
+
 /// <summary>Registro financiero perteneciente a un propietario. El propietario sale de la sesión, nunca del request.</summary>
-public abstract class OwnedEntity
+public abstract class OwnedEntity : IStampedRecord
 {
     public Guid Id { get; set; } = Guid.CreateVersion7();
     public Guid OwnerId { get; set; }
@@ -84,10 +95,12 @@ public sealed class InstallmentPlan : OwnedEntity
     public List<Installment> Installments { get; set; } = [];
 }
 
-public sealed class Installment
+public sealed class Installment : IStampedRecord
 {
     public Guid Id { get; set; } = Guid.CreateVersion7();
     public Guid OwnerId { get; set; }
+    public DateTimeOffset CreatedAt { get; set; }
+    public DateTimeOffset UpdatedAt { get; set; }
     public Guid PlanId { get; set; }
     public InstallmentPlan? Plan { get; set; }
     public int Number { get; set; }
@@ -115,10 +128,13 @@ public sealed class Payment : OwnedEntity
     public List<PaymentAllocation> Allocations { get; set; } = [];
 }
 
-public sealed class PaymentAllocation
+public sealed class PaymentAllocation : IStampedRecord
 {
     public Guid Id { get; set; } = Guid.CreateVersion7();
     public Guid OwnerId { get; set; }
+    public DateTimeOffset CreatedAt { get; set; }
+    public DateTimeOffset UpdatedAt { get; set; }
+    public long Version { get; set; } = 1;
     public Guid PaymentId { get; set; }
     public Payment? Payment { get; set; }
     public Guid? InstallmentId { get; set; }
@@ -186,6 +202,18 @@ public sealed class AuditEvent
     public string? CorrelationId { get; set; }
     /// <summary>IP minimizada (/24 en IPv4, /48 en IPv6).</summary>
     public string? IpPrefix { get; set; }
+}
+
+/// <summary>
+/// Centinela del key ring de Data Protection: un valor conocido protegido la primera vez que la API arranca con esta base.
+/// Si al arrancar no se puede desproteger, el key ring se perdió o se reemplazó y la API no arranca (no se generan claves
+/// nuevas en silencio). Fila única (id = 1).
+/// </summary>
+public sealed class KeyRingSentinel
+{
+    public int Id { get; set; } = 1;
+    public required string ProtectedValue { get; set; }
+    public DateTimeOffset CreatedAt { get; set; }
 }
 
 public sealed class AppUser : IdentityUser<Guid>

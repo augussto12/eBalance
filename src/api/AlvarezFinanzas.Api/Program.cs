@@ -1,5 +1,4 @@
 using System.Net;
-using System.Security.Cryptography.X509Certificates;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Threading.RateLimiting;
@@ -18,7 +17,11 @@ namespace AlvarezFinanzas;
 
 public partial class Program
 {
-    /// <summary>PBKDF2-HMAC-SHA512 (formato v3 de Identity). OWASP recomienda 210.000 iteraciones para esta variante.</summary>
+    /// <summary>
+    /// PBKDF2-HMAC-SHA512 (formato v3 de Identity). OWASP recomienda 210.000 iteraciones para esta variante. Coste medido
+    /// (PasswordHashingTests): unos 156–159 ms por verificación en 4 vCPU Xeon a 2,1 GHz con .NET 10.0.13. Los hashes con una
+    /// política anterior se re-hashean al iniciar sesión (UserManager.CheckPasswordAsync).
+    /// </summary>
     public const int PasswordIterations = 210_000;
 
     public static async Task<int> Main(string[] args)
@@ -28,6 +31,8 @@ public partial class Program
             return await Cli.RunAsync(args);
         }
         var app = Build(args);
+        // Si el key ring no corresponde a la base, KeyRingGuard aborta el arranque: el proceso termina con error y el
+        // motivo queda en el log (Critical «Key ring rechazado»), nunca una API con claves nuevas.
         await app.RunAsync();
         return 0;
     }
@@ -71,46 +76,20 @@ public partial class Program
             c.ProblemDetails.Extensions["correlationId"] = c.HttpContext.TraceIdentifier;
         });
 
+        // Propietario de la sesión para los filtros globales por owner_id (defensa adicional a los filtros explícitos).
+        services.AddScoped<ICurrentOwner, SessionOwner>();
         services.AddDbContext<AppDbContext>(o =>
         {
             o.UseNpgsql(SecretFiles.BuildConnectionString(config, "App"), npg => npg.CommandTimeout(15))
              .UseSnakeCaseNamingConvention();
         });
 
-        // Data Protection: key ring persistido y cifrado explícitamente con certificado. Fallar cerrado en producción.
-        var dp = services.AddDataProtection().SetApplicationName(Require(options.DataProtectionApplicationName, "App:DataProtectionApplicationName"));
-        if (!string.IsNullOrEmpty(options.KeyRingPath))
-        {
-            dp.PersistKeysToFileSystem(new DirectoryInfo(options.KeyRingPath));
-        }
-        else if (env.IsProduction())
-        {
-            throw new InvalidOperationException("Falta App:KeyRingPath en producción.");
-        }
-        if (!string.IsNullOrEmpty(options.KeyRingCertificatePath))
-        {
-            var password = string.IsNullOrEmpty(options.KeyRingCertificatePasswordFile)
-                ? null
-                : SecretFiles.Read(options.KeyRingCertificatePasswordFile, "contraseña del certificado del key ring");
-            var cert = X509CertificateLoader.LoadPkcs12FromFile(options.KeyRingCertificatePath, password, X509KeyStorageFlags.EphemeralKeySet);
-            // Certificados anteriores (rotación): siguen pudiendo descifrar claves viejas, pero no cifran claves nuevas.
-            var all = new List<X509Certificate2> { cert };
-            var dir = Path.GetDirectoryName(options.KeyRingCertificatePath);
-            if (dir is not null && Directory.Exists(dir))
-            {
-                foreach (var previous in Directory.GetFiles(dir, "previous-*.pfx").Order(StringComparer.Ordinal))
-                {
-                    var pwFile = Path.ChangeExtension(previous, ".password");
-                    var pw = File.Exists(pwFile) ? SecretFiles.Read(pwFile, "contraseña de certificado anterior") : null;
-                    all.Add(X509CertificateLoader.LoadPkcs12FromFile(previous, pw, X509KeyStorageFlags.EphemeralKeySet));
-                }
-            }
-            dp.ProtectKeysWithCertificate(cert).UnprotectKeysWithAnyCertificate([.. all]);
-        }
-        else if (env.IsProduction())
-        {
-            throw new InvalidOperationException("Falta App:KeyRingCertificatePath en producción: el key ring debe cifrarse.");
-        }
+        // Data Protection: key ring persistido y cifrado explícitamente con certificado. Fallar cerrado en producción,
+        // también si el key ring no corresponde a la base (KeyRingGuard verifica el centinela antes de que se cree ninguna clave).
+        services.AddDataProtection().ConfigureKeyRing(options, env.IsProduction());
+        services.AddSingleton<ReadOnlyKeyRing>();
+        services.AddSingleton<KeyRingGuard>();
+        services.AddHostedService(sp => sp.GetRequiredService<KeyRingGuard>());
 
         services.AddIdentityCore<AppUser>(o =>
             {
@@ -222,9 +201,6 @@ public partial class Program
         services.AddHostedService<MaintenanceService>();
         services.AddHealthChecks();
     }
-
-    private static string Require(string value, string name) =>
-        string.IsNullOrWhiteSpace(value) ? throw new InvalidOperationException($"Falta la configuración {name}.") : value;
 
     public static void ConfigurePipeline(WebApplication app)
     {

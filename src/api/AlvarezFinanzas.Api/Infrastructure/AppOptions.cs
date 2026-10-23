@@ -11,6 +11,11 @@ public sealed class AppOptions
     /// <summary>Certificado PFX que cifra el key ring (archivo montado como secreto).</summary>
     public string? KeyRingCertificatePath { get; set; }
     public string? KeyRingCertificatePasswordFile { get; set; }
+    /// <summary>
+    /// Verificar al arrancar que el key ring descifra el centinela guardado en la base (si no, la API no arranca). Siempre
+    /// activo en producción, aunque valga false; en otros entornos se activa con true y requiere KeyRingPath.
+    /// </summary>
+    public bool VerifyKeyRingAtStartup { get; set; }
     /// <summary>Proxies de confianza para X-Forwarded-For (IPs o CIDR separadas por coma).</summary>
     public string TrustedProxies { get; set; } = "";
     public int SessionIdleMinutes { get; set; } = 30;

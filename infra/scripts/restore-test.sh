@@ -46,6 +46,13 @@ for _ in $(seq 1 30); do docker exec "$proj-db" pg_isready -U restore -d alvarez
 sleep 2
 docker run --rm --network "$net" -v "$work:/w:ro" -e PGPASSWORD="$pw" "$pg_img" \
   pg_restore -h "$proj-db" -U restore -d alvarez --no-owner --no-privileges --exit-on-error /w/alvarez.dump
+# Igual que restore.sh: migraciones pendientes sobre la copia. Un backup previo a un deploy tiene el esquema anterior y la
+# API nueva lo necesita (p. ej. la tabla del centinela del key ring). Sin GRANT: los roles de producción no existen acá.
+info "Migraciones pendientes sobre la copia"
+docker run --rm --network "$net" --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges:true \
+  -v "$work/pw:/run/secrets/pw:ro" -e App__SkipGrants=true -e ConnectionStrings__MigratorPasswordFile=/run/secrets/pw \
+  -e "ConnectionStrings__Migrator=Host=$proj-db;Database=alvarez;Username=restore;Gss Encryption Mode=Disable" \
+  "$api_img" migrate
 
 info "API aislada con el key ring restaurado"
 common=(--network "$net" --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges:true
