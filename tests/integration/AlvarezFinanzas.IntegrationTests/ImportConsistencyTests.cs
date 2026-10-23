@@ -136,6 +136,91 @@ public class ImportConsistencyTests(PostgresFixture pg)
         Assert.Empty((await a.GetJson("/api/v1/plans")).EnumerateArray());
     }
 
+    /// <summary>
+    /// Otra escritura Serializable del mismo propietario confirma mientras la importación está por confirmarse y forma con
+    /// ella una dependencia peligrosa: PostgreSQL cancela la importación en el COMMIT (40001). Ese error no es una
+    /// DbUpdateException; antes llegaba como 500. Ahora es 409, nada queda escrito y la misma vista previa se puede confirmar.
+    /// </summary>
+    [Fact]
+    public async Task Serialization_failure_at_commit_returns_409_and_the_same_preview_can_be_committed_again()
+    {
+        var hook = new SerializableCommitHook();
+        await using var app = await TestApp.StartAsync(pg, configureServices: hook.Register());
+        var a = await app.SignedInAsync();
+        var doc = Doc();
+        doc["transfers"] = new JsonArray();
+        var preview = await PreviewAsync(a, doc.ToJsonString());
+        Assert.Equal(HttpStatusCode.OK, preview.StatusCode);
+        var batchId = (await preview.Json()).Str("batchId");
+        Guid owner;
+        await using (var db = app.NewDbContext()) owner = (await db.Users.SingleAsync()).Id;
+
+        hook.Arm(async () =>
+        {
+            // Lee lo que la importación escribió (su lote) y escribe algo que la importación leyó (registros importados), y
+            // confirma primero: la importación queda como «pivot» de la dependencia y se cancela en su COMMIT.
+            await using var conn = new Npgsql.NpgsqlConnection(app.ConnectionString);
+            await conn.OpenAsync();
+            await using var tx = await conn.BeginTransactionAsync(System.Data.IsolationLevel.Serializable);
+            await using (var read = new Npgsql.NpgsqlCommand("SELECT count(*) FROM import_batches WHERE owner_id = @o", conn, tx))
+            {
+                read.Parameters.AddWithValue("o", owner);
+                await read.ExecuteScalarAsync();
+            }
+            await using (var write = new Npgsql.NpgsqlCommand(
+                "INSERT INTO imported_records (id, owner_id, source_type, source_id, content_hash, target_type, target_id, batch_id, created_at) " +
+                "VALUES (@id, @o, 'otra_escritura', 'concurrente-1', '\\x00', 'entry', @id, @id, now())", conn, tx))
+            {
+                write.Parameters.AddWithValue("id", Guid.NewGuid());
+                write.Parameters.AddWithValue("o", owner);
+                await write.ExecuteNonQueryAsync();
+            }
+            await tx.CommitAsync();
+        });
+        var commit = await a.PostAsync($"/api/v1/imports/{batchId}/commit", new { confirm = true }, Key("restore-pivot-0001"));
+        var body = await commit.Content.ReadAsStringAsync();
+        Assert.True(commit.StatusCode == HttpStatusCode.Conflict, $"{(int)commit.StatusCode} {body}");
+        Assert.Contains("al mismo tiempo", (await commit.Json()).Str("title"));
+        Assert.Empty((await a.GetJson("/api/v1/accounts?includeDeleted=true")).EnumerateArray());
+        Assert.Empty((await a.GetJson("/api/v1/plans")).EnumerateArray());
+
+        var retry = await a.PostAsync($"/api/v1/imports/{batchId}/commit", new { confirm = true }, Key("restore-pivot-0001"));
+        Assert.True(retry.StatusCode == HttpStatusCode.OK, await retry.Content.ReadAsStringAsync());
+        Assert.Equal(3, (await a.GetJson("/api/v1/accounts")).GetArrayLength());
+        Assert.Single((await a.GetJson("/api/v1/payments")).GetProperty("items").EnumerateArray());
+    }
+
+    /// <summary>
+    /// El plan o el gasto del archivo ya existían (mismo contenido) y se eliminaron después de exportar: un pago nuevo del
+    /// archivo no puede quedar vigente sobre algo que está en la papelera (la exportación siguiente sería inválida).
+    /// </summary>
+    [Fact]
+    public async Task Restore_does_not_apply_a_new_payment_to_a_plan_that_is_in_the_trash()
+    {
+        await using var app = await TestApp.StartAsync(pg);
+        var a = await app.SignedInAsync();
+        var doc = Doc();
+        doc["transfers"] = new JsonArray();
+        doc["payments"] = new JsonArray();
+        var first = await PreviewAsync(a, doc.ToJsonString());
+        await a.PostJson($"/api/v1/imports/{(await first.Json()).Str("batchId")}/commit", new { confirm = true }, HttpStatusCode.OK, Key("restore-sin-pagos-1"));
+        var plan = Assert.Single((await a.GetJson("/api/v1/plans")).EnumerateArray());
+        Assert.Equal(HttpStatusCode.OK, (await a.DeleteAsync($"/api/v1/plans/{plan.Str("id")}?version={plan.GetProperty("version").GetInt64()}")).StatusCode);
+
+        var withPayment = Doc();
+        withPayment["transfers"] = new JsonArray();
+        withPayment["payments"]![0]!["amountMinor"] = "10000";
+        withPayment["payments"]![0]!["allocations"] = JsonNode.Parse("""[{"planId":"plan-1","installmentNumber":1,"amountMinor":"10000"}]""");
+        var second = await PreviewAsync(a, withPayment.ToJsonString());
+        Assert.Equal(HttpStatusCode.OK, second.StatusCode);
+        var commit = await a.PostAsync($"/api/v1/imports/{(await second.Json()).Str("batchId")}/commit", new { confirm = true }, Key("restore-con-pago-1"));
+        Assert.True(commit.StatusCode == HttpStatusCode.Conflict, await commit.Content.ReadAsStringAsync());
+        Assert.Contains("papelera", (await commit.Json()).Str("title"));
+        Assert.Equal(0, (await a.GetJson("/api/v1/payments?includeReversed=true")).GetProperty("total").GetInt32());
+        var trashed = await a.GetJson($"/api/v1/plans/{plan.Str("id")}");
+        Assert.Equal("0", trashed.Str("paidMinor"));
+    }
+
     [Fact]
     public async Task Legacy_preview_always_warns_that_the_file_has_no_balances_payments_or_due_dates()
     {

@@ -137,8 +137,16 @@ public sealed class PaymentAllocation : IStampedRecord
     public long Version { get; set; } = 1;
     public Guid PaymentId { get; set; }
     public Payment? Payment { get; set; }
+    /// <summary>
+    /// Cuota pagada. Queda en null solo en la asignación de un pago revertido cuya cuota dejó de existir al acortar el
+    /// plan: el historial conserva el plan y el número (<see cref="PlanId"/>, <see cref="InstallmentNumber"/>).
+    /// </summary>
     public Guid? InstallmentId { get; set; }
     public Installment? Installment { get; set; }
+    /// <summary>Copia del plan y del número de la cuota al crear la asignación (null en los gastos de tarjeta).</summary>
+    public Guid? PlanId { get; set; }
+    public InstallmentPlan? Plan { get; set; }
+    public int? InstallmentNumber { get; set; }
     public Guid? EntryId { get; set; }
     public Entry? Entry { get; set; }
     public long AmountMinor { get; set; }

@@ -41,8 +41,9 @@ public sealed class PostgresFixture : IAsyncLifetime
 }
 
 /// <param name="keyRingPath">Key ring compartido entre arranques (reinicios, pérdida simulada). Si es null, uno temporal propio.</param>
+/// <param name="configureServices">Servicios extra de la prueba (p. ej. un interceptor de EF para provocar una carrera).</param>
 public sealed class TestApp(string connectionString, IDictionary<string, string>? settings = null, string environment = "Testing",
-    string? keyRingPath = null) : WebApplicationFactory<Program>
+    string? keyRingPath = null, Action<IServiceCollection>? configureServices = null) : WebApplicationFactory<Program>
 {
     public const string Origin = "https://localhost";
     public FakeTimeProvider Clock { get; } = new(DateTimeOffset.UtcNow);
@@ -64,14 +65,16 @@ public sealed class TestApp(string connectionString, IDictionary<string, string>
         {
             s.RemoveAll<TimeProvider>();
             s.AddSingleton<TimeProvider>(Clock);
+            configureServices?.Invoke(s);
         });
     }
 
-    public static async Task<TestApp> StartAsync(PostgresFixture pg, IDictionary<string, string>? settings = null)
+    public static async Task<TestApp> StartAsync(PostgresFixture pg, IDictionary<string, string>? settings = null,
+        Action<IServiceCollection>? configureServices = null)
     {
         var connectionString = await pg.CreateDatabaseAsync();
         await MigrateAsync(connectionString);
-        return Start(connectionString, settings);
+        return Start(connectionString, settings, configureServices: configureServices);
     }
 
     /// <summary>Migraciones ANTES de arrancar la API, como en producción (migrate y después up).</summary>
@@ -82,9 +85,10 @@ public sealed class TestApp(string connectionString, IDictionary<string, string>
     }
 
     /// <summary>Arranca la API sobre una base ya migrada (p. ej. un reinicio con el mismo key ring u otro).</summary>
-    public static TestApp Start(string connectionString, IDictionary<string, string>? settings = null, string environment = "Testing", string? keyRingPath = null)
+    public static TestApp Start(string connectionString, IDictionary<string, string>? settings = null, string environment = "Testing", string? keyRingPath = null,
+        Action<IServiceCollection>? configureServices = null)
     {
-        var app = new TestApp(connectionString, settings, environment, keyRingPath);
+        var app = new TestApp(connectionString, settings, environment, keyRingPath, configureServices);
         try
         {
             _ = app.Services;
@@ -149,6 +153,49 @@ public sealed class TestApp(string connectionString, IDictionary<string, string>
 public sealed class FixedOwner(Guid ownerId) : ICurrentOwner
 {
     public Guid? OwnerId => ownerId;
+}
+
+/// <summary>
+/// Ejecuta una acción de la prueba justo antes del COMMIT de la próxima transacción Serializable de la API (una sola vez):
+/// permite reproducir sin azar una escritura concurrente que llega mientras un pago o una importación están en curso.
+/// </summary>
+public sealed class SerializableCommitHook : Microsoft.EntityFrameworkCore.Diagnostics.DbTransactionInterceptor
+{
+    private Func<Task>? _action;
+
+    public void Arm(Func<Task> action) => Volatile.Write(ref _action, action);
+
+    public override async ValueTask<Microsoft.EntityFrameworkCore.Diagnostics.InterceptionResult> TransactionCommittingAsync(
+        System.Data.Common.DbTransaction transaction, Microsoft.EntityFrameworkCore.Diagnostics.TransactionEventData eventData,
+        Microsoft.EntityFrameworkCore.Diagnostics.InterceptionResult result, CancellationToken cancellationToken = default)
+    {
+        if (transaction.IsolationLevel == System.Data.IsolationLevel.Serializable && Interlocked.Exchange(ref _action, null) is { } action)
+            await action();
+        return result;
+    }
+
+    /// <summary>Registra el interceptor en el AppDbContext de la API.</summary>
+    public Action<IServiceCollection> Register() => s => s.ConfigureDbContext<AppDbContext>(o => o.AddInterceptors(this));
+}
+
+/// <summary>Consultas directas a PostgreSQL para pruebas de concurrencia.</summary>
+public static class PgProbe
+{
+    /// <summary>Espera hasta que alguna sesión de esta base esté bloqueada esperando un lock, o hasta que termine <paramref name="until"/>.</summary>
+    public static async Task<bool> WaitForLockWaitAsync(string connectionString, Task until, TimeSpan timeout)
+    {
+        await using var conn = new NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+        var deadline = DateTime.UtcNow + timeout;
+        while (DateTime.UtcNow < deadline && !until.IsCompleted)
+        {
+            await using var cmd = new NpgsqlCommand(
+                "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'", conn);
+            if ((long)(await cmd.ExecuteScalarAsync())! > 0) return true;
+            await Task.Delay(25);
+        }
+        return false;
+    }
 }
 
 public sealed class Client(TestApp app, HttpClient http, CookieContainer cookies)

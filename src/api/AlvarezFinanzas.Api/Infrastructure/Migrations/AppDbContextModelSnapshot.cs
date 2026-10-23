@@ -910,6 +910,10 @@ namespace AlvarezFinanzas.Infrastructure.Migrations
                         .HasColumnType("uuid")
                         .HasColumnName("installment_id");
 
+                    b.Property<int?>("InstallmentNumber")
+                        .HasColumnType("integer")
+                        .HasColumnName("installment_number");
+
                     b.Property<Guid>("OwnerId")
                         .HasColumnType("uuid")
                         .HasColumnName("owner_id");
@@ -917,6 +921,10 @@ namespace AlvarezFinanzas.Infrastructure.Migrations
                     b.Property<Guid>("PaymentId")
                         .HasColumnType("uuid")
                         .HasColumnName("payment_id");
+
+                    b.Property<Guid?>("PlanId")
+                        .HasColumnType("uuid")
+                        .HasColumnName("plan_id");
 
                     b.Property<DateTimeOffset>("UpdatedAt")
                         .ValueGeneratedOnAdd()
@@ -943,11 +951,16 @@ namespace AlvarezFinanzas.Infrastructure.Migrations
                     b.HasIndex("OwnerId", "PaymentId")
                         .HasDatabaseName("ix_payment_allocations_owner_id_payment_id");
 
+                    b.HasIndex("OwnerId", "PlanId")
+                        .HasDatabaseName("ix_payment_allocations_owner_id_plan_id");
+
                     b.ToTable("payment_allocations", null, t =>
                         {
                             t.HasCheckConstraint("ck_allocations_amount", "amount_minor > 0");
 
-                            t.HasCheckConstraint("ck_allocations_target", "(installment_id IS NULL) <> (entry_id IS NULL)");
+                            t.HasCheckConstraint("ck_allocations_installment_number", "installment_number IS NULL OR installment_number >= 1");
+
+                            t.HasCheckConstraint("ck_allocations_target", "NOT (installment_id IS NOT NULL AND entry_id IS NOT NULL) AND (entry_id IS NULL OR (plan_id IS NULL AND installment_number IS NULL)) AND (installment_id IS NOT NULL OR entry_id IS NOT NULL OR (plan_id IS NOT NULL AND installment_number IS NOT NULL))");
                         });
                 });
 
@@ -1461,11 +1474,20 @@ namespace AlvarezFinanzas.Infrastructure.Migrations
                         .IsRequired()
                         .HasConstraintName("fk_payment_allocations_payments_owner_id_payment_id");
 
+                    b.HasOne("AlvarezFinanzas.Domain.InstallmentPlan", "Plan")
+                        .WithMany()
+                        .HasForeignKey("OwnerId", "PlanId")
+                        .HasPrincipalKey("OwnerId", "Id")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .HasConstraintName("fk_payment_allocations_installment_plans_owner_id_plan_id");
+
                     b.Navigation("Entry");
 
                     b.Navigation("Installment");
 
                     b.Navigation("Payment");
+
+                    b.Navigation("Plan");
                 });
 
             modelBuilder.Entity("AlvarezFinanzas.Domain.RecoveryCode", b =>

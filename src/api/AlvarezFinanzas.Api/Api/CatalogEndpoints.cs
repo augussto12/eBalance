@@ -259,6 +259,33 @@ public static class Db
     public static bool IsUniqueViolation(DbUpdateException ex) =>
         ex.InnerException is Npgsql.PostgresException { SqlState: Npgsql.PostgresErrorCodes.UniqueViolation };
 
+    /// <summary>
+    /// Choque con otra escritura simultánea en una transacción Serializable: versión cambiada, clave única tomada o
+    /// fallo de serialización (40001). El 40001 puede llegar envuelto en DbUpdateException (al guardar), directo como
+    /// PostgresException (en una lectura o en el COMMIT) o envuelto por la estrategia de ejecución de Npgsql. → 409.
+    /// </summary>
+    public static bool IsRetryableConflict(Exception ex) =>
+        ex is DbUpdateConcurrencyException
+        || ex is DbUpdateException { InnerException: Npgsql.PostgresException { SqlState: Npgsql.PostgresErrorCodes.SerializationFailure or Npgsql.PostgresErrorCodes.UniqueViolation } }
+        || ex is Npgsql.PostgresException { SqlState: Npgsql.PostgresErrorCodes.SerializationFailure }
+        || ex is InvalidOperationException { InnerException: Npgsql.PostgresException { SqlState: Npgsql.PostgresErrorCodes.SerializationFailure } };
+
+    /// <summary>
+    /// Deshace la transacción después de un error. Si el error fue en el COMMIT, PostgreSQL ya la terminó y Npgsql la da
+    /// por completada: volver a deshacerla no debe convertir un 409 en un 500 (si quedara abierta, la cierra el dispose).
+    /// </summary>
+    public static async Task RollbackQuietlyAsync(Microsoft.EntityFrameworkCore.Storage.IDbContextTransaction tx)
+    {
+        try
+        {
+            await tx.RollbackAsync(CancellationToken.None);
+        }
+        catch (InvalidOperationException)
+        {
+            // Transacción ya completada (incluye ObjectDisposedException).
+        }
+    }
+
     public static async Task<bool> TrySaveAsync(AppDbContext db, CancellationToken ct)
     {
         try

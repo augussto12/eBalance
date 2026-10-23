@@ -304,12 +304,15 @@ public static partial class Cli
     /// Aceptación explícita y auditada de un key ring perdido sin copia (la API se niega a arrancar). Reinicia el segundo
     /// factor de los usuarios cuyo secreto ya no se puede descifrar, revoca todas las sesiones y registra un centinela nuevo
     /// con las claves actuales. No toca datos financieros. Si el key ring se puede restaurar, restaurarlo en su lugar.
+    /// Misma regla que el arranque (<see cref="KeyRingGuard.RefusesStart"/>): también cuando todavía no hay centinela (dump
+    /// anterior a esta versión) y algún secreto TOTP no se descifra; antes respondía «nada que reiniciar» y la API seguía
+    /// sin arrancar.
     /// </summary>
     private static async Task<int> ResetKeyRingAsync(IServiceProvider sp, AppDbContext db, UserManager<AppUser> users)
     {
         var guard = sp.GetRequiredService<KeyRingGuard>();
-        var report = await guard.VerifyAsync(db);
-        if (report.Status != KeyRingStatus.Mismatch)
+        var report = KeyRingGuard.Effective(await guard.VerifyAsync(db));
+        if (!KeyRingGuard.RefusesStart(report))
         {
             Console.WriteLine($"No hay nada que reiniciar: {report.Detail}.");
             return 0;
@@ -317,7 +320,8 @@ public static partial class Cli
         Console.WriteLine($"El key ring no corresponde a esta base: {report.Detail}.");
         var confirm = Prompt("Esto acepta la pérdida del key ring: reinicia el segundo factor de los usuarios cuyo secreto no se puede " +
                              "descifrar, revoca todas las sesiones y registra un centinela nuevo con las claves actuales. Si tenés una copia " +
-                             $"del key ring, cancelá y restaurala (restore.sh --with-keyring). Escribí {ResetKeyRingConfirmation} para confirmar: ");
+                             "del key ring, cancelá y restaurala: solo las claves con ./infra/scripts/restore.sh --keyring-only, o base y claves " +
+                             $"con ./infra/scripts/restore.sh <instantánea> --with-keyring. Escribí {ResetKeyRingConfirmation} para confirmar: ");
         if (confirm != ResetKeyRingConfirmation) { Console.Error.WriteLine("Cancelado."); return 5; }
 
         var reset = 0;

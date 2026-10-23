@@ -5,6 +5,7 @@ using System.Security.Claims;
 using AlvarezFinanzas.Domain;
 using AlvarezFinanzas.Infrastructure;
 using AlvarezFinanzas.Infrastructure.Auth;
+using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.Extensions.Options;
@@ -99,5 +100,41 @@ public class SessionOwnerTests
         Assert.Null(Owner(new DefaultHttpContext()));
         Assert.Null(Owner(null));
         Assert.Null(Owner(Context(AuthConstants.SessionScheme, new Claim(ClaimTypes.NameIdentifier, "no-es-un-guid"), new Claim(AuthConstants.ClaimAmr, "mfa"))));
+    }
+}
+
+/// <summary>Identificador de clave de un payload de Data Protection: base de la nueva protección del centinela y del TOTP.</summary>
+public class KeyRingPayloadTests
+{
+    [Fact]
+    public void Key_id_is_the_same_for_payloads_of_the_same_key_and_differs_between_key_rings()
+    {
+        using var dirA = new TempDir();
+        using var dirB = new TempDir();
+        var a = DataProtectionProvider.Create(new DirectoryInfo(dirA.Path)).CreateProtector("p");
+        var b = DataProtectionProvider.Create(new DirectoryInfo(dirB.Path)).CreateProtector("p");
+        var a1 = KeyRingGuard.KeyIdOf(a.Protect("uno"));
+        var a2 = KeyRingGuard.KeyIdOf(a.Protect("dos"));
+        var b1 = KeyRingGuard.KeyIdOf(b.Protect("uno"));
+        Assert.NotNull(a1);
+        Assert.Equal(16, a1.Length);
+        Assert.Equal(a1, a2);
+        Assert.NotEqual(a1, b1);
+        // El id es el de la clave del key ring (el archivo key-{id}.xml).
+        var file = Assert.Single(Directory.GetFiles(dirA.Path, "key-*.xml"));
+        var id = Guid.Parse(Path.GetFileNameWithoutExtension(file)["key-".Length..]);
+        Assert.Equal(id.ToByteArray(), a1);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("no es base64url!")]
+    [InlineData("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")]
+    public void Values_that_are_not_data_protection_payloads_have_no_key_id(string payload) => Assert.Null(KeyRingGuard.KeyIdOf(payload));
+
+    private sealed class TempDir : IDisposable
+    {
+        public string Path { get; } = Directory.CreateTempSubdirectory("alvarez-dp-").FullName;
+        public void Dispose() => Directory.Delete(Path, true);
     }
 }

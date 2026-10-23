@@ -185,10 +185,11 @@ public static class ImportExportEndpoints
                     ? await importer.LegacyAsync(records, kinds, ct)
                     : await importer.ExportAsync(records, ct);
             }
-            catch (DbUpdateException ex)
+            catch (Exception ex) when (ex is DbUpdateException || Db.IsRetryableConflict(ex))
             {
-                // Los guardados intermedios de la restauración también son atómicos: nada queda escrito.
-                await tx.RollbackAsync(ct);
+                // Los guardados intermedios de la restauración también son atómicos: nada queda escrito. Un 40001 en una
+                // lectura de la transacción Serializable llega como PostgresException, no como DbUpdateException.
+                await Db.RollbackQuietlyAsync(tx);
                 db.ChangeTracker.Clear();
                 return SaveFailure(ex);
             }
@@ -209,9 +210,10 @@ public static class ImportExportEndpoints
                 await db.SaveChangesAsync(ct);
                 await tx.CommitAsync(ct);
             }
-            catch (DbUpdateException ex)
+            catch (Exception ex) when (ex is DbUpdateException || Db.IsRetryableConflict(ex))
             {
-                await tx.RollbackAsync(ct);
+                // Un 40001 en el COMMIT («pivot» de una dependencia con otra escritura Serializable) no es DbUpdateException.
+                await Db.RollbackQuietlyAsync(tx);
                 db.ChangeTracker.Clear();
                 return SaveFailure(ex);
             }
@@ -219,10 +221,12 @@ public static class ImportExportEndpoints
         });
     }
 
-    /// <summary>Choque con otra escritura simultánea → 409; dato que la base rechaza (regla del archivo) → 422. Nunca 500.</summary>
-    private static IResult SaveFailure(DbUpdateException ex) =>
-        Db.IsUniqueViolation(ex) || ex is DbUpdateConcurrencyException
-            || ex.InnerException is Npgsql.PostgresException { SqlState: Npgsql.PostgresErrorCodes.SerializationFailure }
+    /// <summary>
+    /// Choque con otra escritura simultánea (al leer, al guardar o en el COMMIT) → 409; dato que la base rechaza (regla
+    /// del archivo) → 422. Nunca 500. La vista previa sigue vigente: se puede reintentar.
+    /// </summary>
+    private static IResult SaveFailure(Exception ex) =>
+        Db.IsRetryableConflict(ex)
             ? Problems.Conflict("Otra importación se guardó al mismo tiempo. Generá una vista previa nueva.")
             : Problems.Unprocessable("El archivo tiene datos que no cumplen las reglas de la aplicación. No se importó nada.");
 
@@ -233,6 +237,9 @@ public static class ImportExportEndpoints
     {
         private readonly Dictionary<string, Guid> _map = new(StringComparer.Ordinal);
         private readonly Dictionary<string, int> _summary = new() { ["created"] = 0, ["duplicates"] = 0, ["conflicts"] = 0 };
+        private readonly HashSet<Guid> _createdPlans = [];
+
+        private const string InTrash = "Un pago del archivo corresponde a un plan o gasto que está en la papelera. Restauralo y volvé a intentar.";
 
         private async Task<Dictionary<(string, string), Domain.ImportedRecord>> ExistingAsync(List<NormalizedRecord> records, CancellationToken ct)
         {
@@ -407,6 +414,7 @@ public static class ImportExportEndpoints
                 for (var i = 0; i < amounts.Length; i++) plan.Installments[i].AmountMinor = amounts[i];
                 db.Plans.Add(plan);
                 Track(r, "plan", plan.Id);
+                _createdPlans.Add(plan.Id);
             }
             foreach (var r in records.Where(r => r.Target == "transfer" && IsNew(r)))
             {
@@ -447,6 +455,8 @@ public static class ImportExportEndpoints
                         var entry = entryId is null ? null : await db.Entries.Include(e => e.Account).SingleOrDefaultAsync(e => e.Id == entryId && e.OwnerId == owner, ct);
                         if (entry is null || entry.Account?.Kind != AccountKind.CreditCard || entry.AmountMinor - entry.PaidMinor < amount)
                             return Invalid("Un pago no coincide con los gastos del archivo.");
+                        // Ya existía y se eliminó después de exportar: un pago vigente no puede quedar sobre algo en la papelera.
+                        if (entry.DeletedAt is not null) return new ImportResult(_summary, InTrash);
                         entry.PaidMinor += amount;
                         p.Allocations.Add(new PaymentAllocation { OwnerId = owner, PaymentId = p.Id, EntryId = entry.Id, AmountMinor = amount });
                     }
@@ -454,10 +464,18 @@ public static class ImportExportEndpoints
                     {
                         var planId = Ref("plan", bits[1]);
                         var number = L(bits[2]);
-                        var inst = planId is null ? null : await db.Installments.SingleOrDefaultAsync(i => i.PlanId == planId && i.Number == number && i.OwnerId == owner, ct);
+                        var inst = planId is null ? null : await db.Installments.Include(i => i.Plan)
+                            .SingleOrDefaultAsync(i => i.PlanId == planId && i.Number == number && i.OwnerId == owner, ct);
                         if (inst is null || inst.PendingMinor < amount) return Invalid("Un pago no coincide con las cuotas del archivo.");
+                        if (inst.Plan!.DeletedAt is not null) return new ImportResult(_summary, InTrash);
                         inst.PaidMinor += amount;
-                        p.Allocations.Add(new PaymentAllocation { OwnerId = owner, PaymentId = p.Id, InstallmentId = inst.Id, AmountMinor = amount });
+                        // Plan que ya existía: igual que POST /payments, el pago escribe la fila del plan para chocar con un
+                        // borrado o una edición simultánea (409) en vez de dejar un plan eliminado con pagos vigentes.
+                        if (!_createdPlans.Contains(inst.PlanId)) CashEndpoints.TouchPlan(db, inst.Plan);
+                        p.Allocations.Add(new PaymentAllocation
+                        {
+                            OwnerId = owner, PaymentId = p.Id, InstallmentId = inst.Id, PlanId = inst.PlanId, InstallmentNumber = inst.Number, AmountMinor = amount,
+                        });
                     }
                 }
                 if (sum != p.AmountMinor) return Invalid("Un pago no suma lo mismo que sus asignaciones.");
