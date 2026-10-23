@@ -101,9 +101,15 @@ services:
       dockerfile: infra/docker/backup.Dockerfile
     profiles: ["ops"]
     restart: "no"
+    # Sin root: uid/gid 1654, dueño del key ring y del repositorio local (prepare_backup_perms en lib.sh). Se fija acá
+    # y no solo en la imagen para que también valga con la imagen de un release anterior (rollback).
+    user: "1654:1654"
+    read_only: true
     security_opt: ["no-new-privileges:true"]
     cap_drop: ["ALL"]
-    # DAC_OVERRIDE: leer el key ring (uid 1654); CHOWN/FOWNER: restaurar conservando dueños y permisos.
+    # Solo tienen efecto en la extracción de restauraciones, que corre con «--user 0» (restore.sh, restore-test.sh,
+    # restore-config.sh): escribir en el directorio temporal del host (DAC_OVERRIDE) y conservar dueños y permisos
+    # del key ring (CHOWN, FOWNER). Con el usuario 1654 no otorgan nada (Docker no las da a procesos sin root).
     cap_add: ["DAC_OVERRIDE", "CHOWN", "FOWNER"]
     environment:
       RESTIC_REPOSITORY: ${RESTIC_REPOSITORY:-/backups/restic}

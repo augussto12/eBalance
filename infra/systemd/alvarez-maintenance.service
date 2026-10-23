@@ -1,7 +1,8 @@
 [Unit]
-Description=Álvarez Finanzas — purga de auditoría vieja y verificación de TLS
+Description=Álvarez Finanzas — purga de auditoría vieja y verificación de TLS, disco, reloj y backups
 Wants=docker.service
 After=docker.service
+OnFailure=alvarez-alert@%n.service
 
 [Service]
 Type=oneshot

@@ -213,6 +213,12 @@ free_mb=$(df -Pm / | awk 'NR==2{print $4}'); need_mb=8200
 if [[ -f "$APP_DIR/.env" ]] && command -v docker >/dev/null \
    && docker image inspect "alvarez-finanzas-api:$(sed -n 's/^IMAGE_TAG=//p' "$APP_DIR/.env" | head -1)" >/dev/null 2>&1; then need_mb=3000; fi
 (( free_mb > need_mb )) || block "Hay ${free_mb} MiB libres en /; hacen falta al menos ${need_mb} MiB para imágenes, compilación y backups."
+# Los códigos TOTP dependen de la hora: preflight falla si systemd dice que el reloj no está sincronizado.
+case "$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)" in
+  yes) echo "Reloj: sincronizado por NTP" ;;
+  no) warn "El reloj NO está sincronizado por NTP (los códigos TOTP dependen de la hora). Antes de instalar: timedatectl set-ntp true (y revisá timedatectl timesync-status); si no, el preflight falla." ;;
+  *) echo "Reloj: no se pudo consultar timedatectl" ;;
+esac
 
 # Resolución por DNS PÚBLICO (la que ve Let's Encrypt), no por /etc/hosts ni el resolver local, que suelen mapear el
 # nombre propio del servidor aunque no exista afuera. Se consulta por DoH; si no hay salida, se usa el DNS del sistema.
@@ -544,13 +550,14 @@ say "Backup inicial y prueba de restauración aislada"
 ./infra/scripts/backup.sh </dev/null
 ./infra/scripts/restore-test.sh </dev/null
 
-say "Timers: renovación TLS (2 por día), backup y mantenimiento (diarios)"
+say "Timers: TLS (2 por día), backup y mantenimiento (diarios), chequeo (cada hora), prueba de restauración (mensual)"
 for unit in infra/systemd/alvarez-*; do
   sed "s#/srv/alvarez-finanzas/app#$APP_DIR#g" "$unit" > "/etc/systemd/system/$(basename "$unit")"
 done
 systemctl daemon-reload
-systemctl enable --now alvarez-certbot.timer alvarez-backup.timer alvarez-maintenance.timer >/dev/null
-systemctl list-timers 'alvarez-*' --no-pager | head -4 || true
+systemctl enable --now alvarez-certbot.timer alvarez-backup.timer alvarez-maintenance.timer \
+  alvarez-healthcheck.timer alvarez-restore-test.timer >/dev/null
+systemctl list-timers 'alvarez-*' --no-pager | head -6 || true
 
 # ---------------------------------------------------------------- 7. Propietario
 say "Tu usuario"
@@ -582,7 +589,8 @@ cat <<MSG
     y  $BASE/secrets/keyring/  (current.pfx + current.password).
  3. Cambiá ya la contraseña de root (quedó compartida):  passwd
     Recomendado: entrar por SSH con claves y desactivar el login por contraseña.
- 4. Configurá una copia de backups fuera de la VPS (docs/RUNBOOK.md §4).
+ 4. Configurá una copia de backups fuera de la VPS (docs/RUNBOOK.md §4)
+    y, si querés recibir avisos de fallas, ALERT_WEBHOOK_URL o ALERT_EMAIL (§3).
  Registro de esta instalación: $LOG (sin secretos ni montos).
 ========================================================================
 MSG

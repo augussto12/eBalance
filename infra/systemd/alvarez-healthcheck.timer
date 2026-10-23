@@ -1,0 +1,9 @@
+[Unit]
+Description=Chequeo de Álvarez Finanzas cada hora (servicios y disco)
+
+[Timer]
+OnCalendar=*-*-* *:07:00
+RandomizedDelaySec=5m
+
+[Install]
+WantedBy=timers.target

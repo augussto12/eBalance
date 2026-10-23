@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Certificados TLS con certbot oficial en contenedor (versión fijada por digest), con configuración AISLADA en
 # /etc/alvarez-finanzas/letsencrypt: no toca ni depende del certbot que el servidor tenga para otros sitios.
-#   certbot.sh issue ip 31.97.241.220      certificado para la IP (perfil shortlived, ~6 días; LE GA desde 2026-01-15)
+#   certbot.sh issue ip 203.0.113.10       certificado para la IP (perfil shortlived, ~6 días; LE GA desde 2026-01-15)
 #   certbot.sh issue host srv123.hstgr.cloud   certificado normal (90 días) para un nombre
 #   certbot.sh renew                        renueva si corresponde (lo llama el timer alvarez-certbot) y recarga Nginx
 # Desafío http-01 por webroot (/var/www/certbot), servido por el bloque :80 del sitio de Nginx.

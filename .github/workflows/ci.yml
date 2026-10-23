@@ -1,8 +1,11 @@
-# CI: pruebas, build de imágenes, auditoría de dependencias y escaneo de secretos. Sin secretos productivos.
+# CI: pruebas, build y escaneo de imágenes, auditoría de dependencias, scripts de operación y escaneo de secretos.
+# Sin secretos productivos. El escaneo semanal detecta CVE publicadas después del último push.
 name: ci
 on:
   push:
   pull_request:
+  schedule:
+    - cron: "17 6 * * 1"
 permissions:
   contents: read
 
@@ -52,6 +55,27 @@ jobs:
       - run: docker build -f infra/docker/web.Dockerfile -t alvarez-finanzas-web:ci .
       - run: docker build -f infra/docker/backup.Dockerfile -t alvarez-finanzas-backup:ci .
       - run: docker compose --env-file .env.example config -q
+      - name: Logs de Nginx sin query string ni IP completa (contenedor web y sitio del host)
+        run: infra/tests/nginx-logs.sh alvarez-finanzas-web:ci
+      - name: Escaneo de imágenes (Trivy fijado; falla con HIGH/CRITICAL corregibles fuera de infra/trivy-ignore.yaml)
+        run: SCAN_BASE=1 infra/scripts/scan-images.sh ci
+
+  scripts:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: shellcheck de los scripts de operación
+        run: |
+          docker run --rm -v "$PWD:/mnt:ro" -w /mnt \
+            koalaman/shellcheck:v0.11.0@sha256:61862eba1fcf09a484ebcc6feea46f1782532571a34ed51fedf90dd25f925a8d \
+            -x -P infra/scripts -S warning infra/scripts/*.sh infra/tests/*.sh infra/docker/*.sh infra/docker/postgres/*.sh infra/e2e/*.sh
+      - name: Avisos de falla (alert.sh contra un receptor HTTPS local)
+        run: infra/tests/alerts.sh
+      - name: Unidades systemd válidas
+        run: |
+          mkdir -p "$RUNNER_TEMP/units"
+          for u in infra/systemd/*; do sed "s#/srv/alvarez-finanzas/app#$PWD#g" "$u" > "$RUNNER_TEMP/units/$(basename "$u")"; done
+          cd "$RUNNER_TEMP/units" && systemd-analyze verify --man=no ./alvarez-*.service ./alvarez-*.timer
 
   secrets:
     runs-on: ubuntu-24.04

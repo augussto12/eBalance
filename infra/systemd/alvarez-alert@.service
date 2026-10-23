@@ -1,0 +1,9 @@
+# Lo dispara OnFailure= de los servicios alvarez-* (%i = la unidad que falló). Registra la falla y, SOLO si el
+# propietario configuró ALERT_WEBHOOK_URL o ALERT_EMAIL en .env, avisa. Nunca con contenido financiero.
+[Unit]
+Description=Álvarez Finanzas — aviso de falla de %i
+
+[Service]
+Type=oneshot
+WorkingDirectory=/srv/alvarez-finanzas/app
+ExecStart=/srv/alvarez-finanzas/app/infra/scripts/alert.sh %i
