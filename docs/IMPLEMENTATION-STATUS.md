@@ -54,7 +54,7 @@ Se corrigieron los huecos del repositorio en cinco ramas: pagos y planes, claves
 | `dotnet list … package --vulnerable --include-transitive` | Sin vulnerabilidades |
 | `npm audit` (web y e2e) | 0 vulnerabilidades |
 | Modo desarrollo (`dotnet run` + `vite` con proxy) | Login por el proxy: OK |
-| GitHub Actions `ci` (run 39898212594, commit b5ae0fb) | backend, frontend, scripts (shellcheck, alertas, systemd), images (Trivy, logs de Nginx) y secrets (gitleaks): OK |
+| GitHub Actions `ci` (run 39907835218, commit c422fbc, con todas las correcciones) | backend, frontend, scripts (shellcheck, alertas, systemd), images (Trivy, logs de Nginx) y secrets (gitleaks): OK |
 | `vps-install.sh --inspect` y la instalación completa, en un entorno que simula la VPS (Ubuntu 24.04, nginx 1.24 del host, IP pública de la VPS redirigida a local con iptables, Pebble 2.10 como ACME) | OK, `TLS_MODE=auto` → IP. Certificado de IP (perfil `shortlived`) por http-01 con el sitio temporal, sitio final, build, migración, smoke tests, preflight con TLS **verificado** (cadena + IP), backup y restore-test (resultado=OK, 27 s). Re-ejecución sobre una instalación a medias y `--inspect` sobre una completa: OK. En `install.log` no hay montos ni secretos |
 | Verificación externa del sitio instalado | HTTP/2 200 con CSP; `http://` → 301 a `https://`; Host o SNI ajenos → 421; `/api/v1/entries` sin sesión → 401; web solo en `127.0.0.1:8088` |
 | `install-nginx-site.sh` con `nginx -t` fallido, con otro sitio roto y `--acme-only`/`--remove-acme` | Restaura el sitio anterior sin recargar; no toca nada si `nginx -t` ya fallaba; el sitio temporal responde antes de pedir el certificado |
