@@ -6,7 +6,9 @@
 #   2. «restore.sh --keyring-only» restaura solo las claves: la API vuelve con las claves originales y la base queda
 #      intacta (una fila agregada DESPUÉS del último backup sigue ahí; conteos y sumas iguales);
 #   3. el backup siguiente vuelve a respaldar el key ring.
-# Las claves originales se guardan en un directorio temporal y se reponen si algo falla.
+# Las claves originales se guardan en un directorio temporal y se reponen si algo falla. Con la API de un release
+# anterior al centinela (sin «keyRingSentinel» en verify-data, p. ej. después de un rollback), el paso de la falla
+# cerrada se omite: esa API generaría claves nuevas en silencio, así que no se la arranca con el volumen vacío.
 #   sudo infra/tests/keyring-restore.sh
 source "$(dirname "$0")/../scripts/lib.sh"
 load_env
@@ -49,23 +51,28 @@ good="$(backup_ops resolve-keyring | tr -d '\r')"
 [[ -n "$good" ]] || fail "no hay una instantánea del key ring con claves"
 psql_admin -c "INSERT INTO $schema.marca VALUES ('después del backup')" >/dev/null
 api_cli verify-data > "$tmp/before.json" || fail "verify-data antes de la prueba"
+guard=0; grep -q '"keyRingSentinel"' "$tmp/before.json" && guard=1
 ok "estado inicial: claves $(wc -l <<<"$orig_keys"), key ring respaldado en $good y una fila posterior al backup"
 
 info "Se pierde el volumen de claves"
 dc stop web api </dev/null
 docker run --rm --user 0 -v "$keys_volume:/keys" --entrypoint sh "$backup_img" -c 'rm -f /keys/*'
 [[ -z "$(key_names)" ]] || fail "no se vació el volumen de claves"
-since="$(date -u +%FT%TZ)"
-dc up -d --no-deps api </dev/null >/dev/null 2>&1 || true
-refused=0
-for _ in $(seq 1 30); do
-  if dc logs --no-color --since "$since" api 2>/dev/null | grep -q 'Key ring rechazado'; then refused=1; break; fi
-  sleep 2
-done
-(( refused )) || { dc logs --tail 30 api >&2; fail "la API no rechazó el key ring vacío"; }
-dc stop api </dev/null >/dev/null 2>&1
-[[ -z "$(key_names)" ]] || fail "la API escribió claves nuevas en el volumen vacío"
-ok "con /keys vacío la API no arranca («Key ring rechazado») y no escribe claves"
+if (( guard )); then
+  since="$(date -u +%FT%TZ)"
+  dc up -d --no-deps api </dev/null >/dev/null 2>&1 || true
+  refused=0
+  for _ in $(seq 1 30); do
+    if dc logs --no-color --since "$since" api 2>/dev/null | grep -q 'Key ring rechazado'; then refused=1; break; fi
+    sleep 2
+  done
+  (( refused )) || { dc logs --tail 30 api >&2; fail "la API no rechazó el key ring vacío"; }
+  dc stop api </dev/null >/dev/null 2>&1
+  [[ -z "$(key_names)" ]] || fail "la API escribió claves nuevas en el volumen vacío"
+  ok "con /keys vacío la API no arranca («Key ring rechazado») y no escribe claves"
+else
+  echo "OMITIDO la API desplegada es anterior al centinela: no se la arranca con el volumen vacío"
+fi
 
 if "$ROOT/infra/scripts/backup.sh" </dev/null >"$tmp/backup1.log" 2>&1; then tail -20 "$tmp/backup1.log"; fail "backup.sh terminó bien con el volumen de claves vacío"; fi
 grep -q 'restore.sh --keyring-only' "$tmp/backup1.log" || { tail -20 "$tmp/backup1.log"; fail "backup.sh no indicó cómo recuperar"; }
@@ -87,10 +94,11 @@ import json, sys
 b, a = (json.load(open(p)) for p in sys.argv[1:3])
 for d in (b, a): d["counts"].pop("auditEvents", None)   # revoke-sessions audita
 diff = [k for k in ("counts", "entrySums", "planSums", "totpSecrets", "totpDecryptable") if b.get(k) != a.get(k)]
-assert a["keyRingSentinel"] == "Verified", a["keyRingSentinel"]
+assert a.get("keyRingSentinel", "Verified") == "Verified", a["keyRingSentinel"]
+assert a["totpDecryptable"] == a["totpSecrets"], "TOTP sin descifrar"
 sys.exit(1 if diff else 0)
 PY
-ok "--keyring-only: la API volvió con las claves originales ($good), centinela verificado, base intacta"
+ok "--keyring-only: la API volvió con las claves originales ($good), secretos TOTP descifrables, base intacta"
 
 psql_admin -c "DROP SCHEMA $schema CASCADE" >/dev/null
 "$ROOT/infra/scripts/backup.sh" </dev/null >"$tmp/backup2.log" 2>&1 || { tail -20 "$tmp/backup2.log"; fail "backup después de restaurar las claves"; }
