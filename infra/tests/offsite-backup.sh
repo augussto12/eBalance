@@ -26,6 +26,7 @@ fail() { echo "FALLA $*" >&2; exit 1; }
 last_log() { tail -1 "$BACKUP_DIR/backup.log"; }
 
 info "Repositorio externo sustituto (rest-server con autenticación) en la red $net"
+prepare_backup_perms
 dc --profile ops run --rm -T backup init </dev/null >/dev/null   # crea las redes del proyecto si faltan
 user=alvarez-offsite; pass="$(openssl rand -hex 24)"
 mkdir -p "$tmp/data"
