@@ -1,13 +1,15 @@
 import { useEffect, useMemo, useState } from 'react';
-import { keepPreviousData, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { ApiError, api, idempotencyKey } from '../api/client';
 import type { Obligation, Occurrence, Page, Payment, Plan } from '../api/types';
-import { FieldError, Modal } from '../components/Modal';
+import { Modal, useFieldErrors } from '../components/Modal';
 import { PaymentHistoryDialog, PaymentList } from '../components/Payments';
-import { OccurrenceTable, QueryState } from '../components/Records';
+import { OccurrenceTable, Pager, QueryState, RefetchError, usePageClamp } from '../components/Records';
 import { useUi } from '../components/Ui';
 import { formatDate, todayIso } from '../lib/dates';
+import { problemErrors, type FieldErrors } from '../lib/forms';
 import { formatMoney, minorToInput, parseAmountInput, type Currency } from '../lib/money';
+import { keepPreviousPage, pageCount } from '../lib/paging';
 import { isPaymentsApplied, paymentsOfPlan, type PaymentHistoryTarget } from '../lib/payments';
 import { invalidateFinancial, useAccounts } from './queries';
 
@@ -26,15 +28,19 @@ export function PlansPage({ kind }: { kind: 'card' | 'loan' }) {
   const title = kind === 'card' ? 'Tarjetas y cuotas' : 'Préstamos';
   useEffect(() => setPage(1), [kind, month, currency]);
 
-  const monthRows = useQuery({
-    queryKey: ['movements', month, currency, '', kind, page, PAGE_SIZE],
+  const monthKey = ['movements', month, currency, '', kind, page, PAGE_SIZE];
+  const monthRows = useQuery<Page<Occurrence>>({
+    queryKey: monthKey,
     queryFn: ({ signal }) => {
       const params = new URLSearchParams({ month, currency, type: kind, page: String(page), pageSize: String(PAGE_SIZE) });
       return api<Page<Occurrence>>('GET', `/movements?${params}`, undefined, { signal });
     },
-    placeholderData: keepPreviousData,
+    // Solo al cambiar de página se sigue viendo la anterior: con otra moneda, mes o tipo (Tarjetas ↔ Préstamos usan
+    // este mismo componente) se vería lo de la consulta anterior con el formato de la nueva.
+    placeholderData: keepPreviousPage(monthKey, 5),
   });
-  const pages = monthRows.data ? Math.max(1, Math.ceil(monthRows.data.total / PAGE_SIZE)) : 1;
+  const pages = monthRows.data ? pageCount(monthRows.data.total, PAGE_SIZE) : 1;
+  usePageClamp(page, pages, !!monthRows.data && !monthRows.isPlaceholderData, setPage);
   const plans = useQuery({
     queryKey: ['plans', kind, currency],
     queryFn: ({ signal }) => api<Plan[]>('GET', `/plans?kind=${kind}&currency=${currency}`, undefined, { signal }),
@@ -89,16 +95,10 @@ export function PlansPage({ kind }: { kind: 'card' | 'loan' }) {
         </div>
         {monthRows.data ? (
           <>
+            {/* Tras un pago, una reversión o un borrado se recarga: si falla, no se muestran cuotas viejas en silencio. */}
+            <RefetchError error={monthRows.error} retrying={monthRows.isFetching} onRetry={() => monthRows.refetch()} />
             <OccurrenceTable rows={monthRows.data.items} currency={currency} />
-            {monthRows.data.total > PAGE_SIZE && (
-              <div className="pager">
-                <span>{monthRows.data.total} cuotas · página {page} de {pages}</span>
-                <div>
-                  <button disabled={page <= 1} onClick={() => setPage((n) => n - 1)}>‹ Anterior</button>
-                  <button disabled={page >= pages} onClick={() => setPage((n) => n + 1)}>Siguiente ›</button>
-                </div>
-              </div>
-            )}
+            <Pager page={page} pages={pages} total={monthRows.data.total} noun="cuotas" onPage={setPage} />
           </>
         ) : (
           <QueryState isPending={monthRows.isPending} error={monthRows.error} onRetry={() => monthRows.refetch()} />
@@ -111,6 +111,7 @@ export function PlansPage({ kind }: { kind: 'card' | 'loan' }) {
             <p>Cuotas actuales y restantes, próxima fecha, pagado y pendiente ({currency}).</p>
           </div>
         </div>
+        {plans.data && <RefetchError error={plans.error} retrying={plans.isFetching} onRetry={() => plans.refetch()} />}
         {plans.data ? (
           plans.data.length === 0 ? (
             <div className="empty">Todavía no hay planes en {currency}.</div>
@@ -183,11 +184,29 @@ export function PlansPage({ kind }: { kind: 'card' | 'loan' }) {
   );
 }
 
+type PayField = 'target' | 'source' | 'amount' | 'date';
+
+/**
+ * Claves de validación de POST /payments → campo del diálogo. Las demás (currency, note, idempotencyKey,
+ * allocations…) no tienen campo propio: se suman al mensaje general, nunca se pierden.
+ */
+export const PAYMENT_FIELD_MAP: Readonly<Partial<Record<string, PayField>>> = {
+  targetAccountId: 'target', planId: 'target', sourceAccountId: 'source', amountMinor: 'amount', date: 'date',
+};
+
 /**
  * Pago de tarjeta o cuota: mueve caja y cancela obligaciones, sin crear otro gasto.
  * La clave de idempotencia se genera al abrir: reintentos o doble clic no duplican el pago.
  */
-function PaymentDialog({ kind, currency, target, plans, onClose }: { kind: 'card' | 'loan'; currency: Currency; target: PayTarget; plans: Plan[]; onClose: () => void }) {
+export function PaymentDialog({ kind, currency, target, plans, onClose, initialErrors = {} }: {
+  kind: 'card' | 'loan';
+  currency: Currency;
+  target: PayTarget;
+  plans: Plan[];
+  onClose: () => void;
+  /** Errores de campo con los que arranca el diálogo (se usa en las pruebas de accesibilidad). */
+  initialErrors?: FieldErrors<PayField>;
+}) {
   const qc = useQueryClient();
   const { toast } = useUi();
   const accounts = useAccounts();
@@ -197,9 +216,10 @@ function PaymentDialog({ kind, currency, target, plans, onClose }: { kind: 'card
   const [what, setWhat] = useState('');
   const [amount, setAmount] = useState('');
   const [date, setDate] = useState(todayIso());
-  const [errors, setErrors] = useState<Record<string, string[]>>({});
+  const [errors, setErrors] = useState<FieldErrors<PayField>>(initialErrors);
   const [formError, setFormError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const fe = useFieldErrors(errors);
 
   const cards = (accounts.data ?? []).filter((a) => a.kind === 'credit_card' && a.currency === currency);
   const sources = (accounts.data ?? []).filter((a) => a.kind !== 'credit_card' && a.currency === currency);
@@ -231,15 +251,16 @@ function PaymentDialog({ kind, currency, target, plans, onClose }: { kind: 'card
     e.preventDefault();
     if (busy) return;
     const parsed = parseAmountInput(amount);
-    const errs: Record<string, string[]> = {};
-    if (!source) errs.sourceAccountId = ['Elegí la cuenta desde la que pagás.'];
-    if (!whatId) errs.targetAccountId = ['Elegí qué pagás.'];
-    if (!parsed.ok) errs.amountMinor = [parsed.error];
-    else if (BigInt(parsed.minor) > pendingTotal) errs.amountMinor = ['El importe supera lo pendiente.'];
+    const errs: FieldErrors<PayField> = {};
+    if (!whatId) errs.target = ['Elegí qué pagás.'];
+    if (!source) errs.source = ['Elegí la cuenta desde la que pagás.'];
+    if (!parsed.ok) errs.amount = [parsed.error];
+    else if (BigInt(parsed.minor) > pendingTotal) errs.amount = ['El importe supera lo pendiente.'];
+    if (!date) errs.date = ['Indicá la fecha del pago.'];
     setErrors(errs);
+    setFormError(null);
     if (Object.keys(errs).length || !parsed.ok) return;
     setBusy(true);
-    setFormError(null);
     try {
       const created = await api<Payment>('POST', '/payments', {
         sourceAccountId: source,
@@ -266,10 +287,10 @@ function PaymentDialog({ kind, currency, target, plans, onClose }: { kind: 'card
       });
       onClose();
     } catch (err) {
-      if (err instanceof ApiError) {
-        setErrors(err.fieldErrors);
-        setFormError(err.title);
-      } else setFormError('No se pudo registrar el pago.');
+      // Cada mensaje junto a su campo; los que no tienen campo (moneda, nota, idempotencia, asignaciones) van al general.
+      const r = problemErrors(err, PAYMENT_FIELD_MAP, 'No se pudo registrar el pago.');
+      setErrors(r.fields);
+      setFormError(r.form);
     } finally {
       setBusy(false);
     }
@@ -281,7 +302,7 @@ function PaymentDialog({ kind, currency, target, plans, onClose }: { kind: 'card
         <p className="hint">El pago reduce el saldo de la cuenta y lo pendiente de las cuotas. No es un gasto nuevo: las compras ya se cuentan en su mes.</p>
         <label>
           Qué pagás
-          <select value={what} onChange={(e) => { setWhat(e.target.value); setAmount(''); }} aria-invalid={errors.targetAccountId ? true : undefined}>
+          <select value={what} onChange={(e) => { setWhat(e.target.value); setAmount(''); }} {...fe.props('target')}>
             <option value="">Elegí…</option>
             {kind === 'card' && cards.length > 0 && (
               <optgroup label="Resumen de tarjeta (cuotas y consumos)">
@@ -292,7 +313,7 @@ function PaymentDialog({ kind, currency, target, plans, onClose }: { kind: 'card
               {activePlans.map((p) => <option key={p.id} value={`plan:${p.id}`}>{p.concept}</option>)}
             </optgroup>
           </select>
-          <FieldError id="err-target" errors={errors.targetAccountId ?? errors.planId} />
+          {fe.error('target')}
         </label>
         {whatId && obligations.data && (
           <div className="preview">
@@ -303,21 +324,22 @@ function PaymentDialog({ kind, currency, target, plans, onClose }: { kind: 'card
         )}
         <label>
           Desde la cuenta
-          <select value={source} onChange={(e) => setSource(e.target.value)} aria-invalid={errors.sourceAccountId ? true : undefined}>
+          <select value={source} onChange={(e) => setSource(e.target.value)} {...fe.props('source')}>
             <option value="">Elegí…</option>
             {sources.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
           </select>
-          <FieldError id="err-source" errors={errors.sourceAccountId} />
+          {fe.error('source')}
         </label>
         <div className="fields">
           <label>
             Importe ({currency})
-            <input inputMode="decimal" value={amount} onChange={(e) => setAmount(e.target.value)} aria-invalid={errors.amountMinor ? true : undefined} />
-            <FieldError id="err-amount" errors={errors.amountMinor} />
+            <input inputMode="decimal" value={amount} onChange={(e) => setAmount(e.target.value)} {...fe.props('amount')} />
+            {fe.error('amount')}
           </label>
           <label>
             Fecha
-            <input type="date" value={date} onChange={(e) => setDate(e.target.value)} />
+            <input type="date" value={date} onChange={(e) => setDate(e.target.value)} required {...fe.props('date')} />
+            {fe.error('date')}
           </label>
         </div>
         {formError && <p className="formerror" role="alert">{formError}</p>}

@@ -1,10 +1,11 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { ApiError, api } from '../api/client';
 import type { Occurrence } from '../api/types';
 import { formatDate } from '../lib/dates';
 import { formatMoney, type Currency } from '../lib/money';
 import { isPaymentsApplied, occurrenceHasPayments, paymentsOfOccurrence, paymentsOfPlan, type PaymentHistoryTarget } from '../lib/payments';
+import { clampedPage } from '../lib/paging';
 import { invalidateFinancial } from '../pages/queries';
 import { PaymentHistoryDialog } from './Payments';
 import { useUi } from './Ui';
@@ -157,4 +158,33 @@ export function RefetchError({ error, retrying = false, onRetry }: { error: unkn
       <button type="button" className="linkbtn" onClick={onRetry} disabled={retrying}>{retrying ? 'Reintentando…' : 'Reintentar'}</button>
     </div>
   );
+}
+
+/**
+ * Paginador de una lista del servidor. Se muestra si hay más de una página y también si la actual quedó fuera de
+ * rango (página vacía tras borrar), así nunca se queda sin forma de volver.
+ */
+export function Pager({ page, pages, total, noun, onPage }: { page: number; pages: number; total: number; noun: string; onPage: (page: number) => void }) {
+  if (pages <= 1 && page <= 1) return null;
+  return (
+    <div className="pager">
+      <span>{total} {noun} · página {page} de {pages}</span>
+      <div>
+        <button type="button" disabled={page <= 1} onClick={() => onPage(Math.min(page - 1, pages))}>‹ Anterior</button>
+        <button type="button" disabled={page >= pages} onClick={() => onPage(page + 1)}>Siguiente ›</button>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Si la página actual quedó fuera de rango, vuelve a la última que existe. `settled`: hay datos de esta misma página
+ * (no los de la anterior mientras carga), así el total es el de la consulta actual.
+ */
+export function usePageClamp(page: number, pages: number, settled: boolean, setPage: (page: number) => void): void {
+  useEffect(() => {
+    if (!settled) return;
+    const target = clampedPage(page, pages);
+    if (target !== null) setPage(target);
+  }, [page, pages, settled, setPage]);
 }

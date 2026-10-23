@@ -5,7 +5,9 @@ import type { Account, AccountKind, Category, Entry, Plan } from '../api/types';
 import { distribute, formatMoney, minorToInput, parseAmountInput, type Currency } from '../lib/money';
 import { formatDate, todayIso } from '../lib/dates';
 import { mapFieldErrors, type FieldErrors } from '../lib/forms';
+import { isPaymentsApplied, paymentsOfEntry, paymentsOfPlan, type PaymentHistoryTarget } from '../lib/payments';
 import { Modal, useFieldErrors } from './Modal';
+import { PaymentHistoryDialog } from './Payments';
 import { useUi } from './Ui';
 import { invalidateFinancial, useAccounts, useCategories } from '../pages/queries';
 
@@ -115,6 +117,28 @@ export function visibleFields(f: FormState): Set<keyof FormState> {
 
 const ONGOING_FIELDS: (keyof FormState)[] = ['ongoing', 'paidBefore', 'disbursement', 'disbursementDate', 'disbursementAccountId'];
 
+/** Por qué no se guardó: errores por campo, mensaje general y si fue un cambio concurrente o pagos aplicados. */
+export interface SaveFailure {
+  fields: FieldErrors<keyof FormState>;
+  form: string;
+  /** 409 por versión: el registro cambió en otra pestaña o dispositivo. */
+  conflict: boolean;
+  /** 409 payments_applied: el registro tiene pagos y el cambio los afectaría; se ofrece ver y revertir esos pagos. */
+  paymentsApplied: boolean;
+}
+
+/**
+ * Clasifica el error al guardar. Un 409 con código payments_applied NO es un cambio concurrente: volver a cargar la
+ * misma versión no lo resuelve, así que se muestra el motivo del servidor y el acceso a los pagos.
+ */
+export function saveFailure(err: unknown, fieldMap: Readonly<Partial<Record<string, keyof FormState>>>): SaveFailure {
+  if (!(err instanceof ApiError)) return { fields: {}, form: 'No se pudo guardar. Probá de nuevo.', conflict: false, paymentsApplied: false };
+  // Cada mensaje va junto a su campo; las claves sin campo (p. ej. version) se suman al mensaje general.
+  const { fields, other } = mapFieldErrors(err.fieldErrors, fieldMap);
+  const paymentsApplied = isPaymentsApplied(err);
+  return { fields, form: [err.title, ...other].join(' '), conflict: err.status === 409 && !paymentsApplied, paymentsApplied };
+}
+
 export function RecordDialog({ target, onClose }: { target: RecordTarget | null; onClose: () => void }) {
   const { currency } = useUi();
   const open = target !== null;
@@ -132,6 +156,12 @@ export function RecordDialog({ target, onClose }: { target: RecordTarget | null;
     staleTime: 0,
   });
 
+  // Pagos del registro abierto: se muestran en otro modal encima del formulario, que sigue abierto debajo.
+  const [payments, setPayments] = useState<PaymentHistoryTarget | null>(null);
+  useEffect(() => {
+    if (!open) setPayments(null);
+  }, [open]);
+
   const title = target?.mode === 'create' ? 'Nuevo registro' : 'Editar registro';
   let body: React.ReactNode = null;
   if (target?.mode === 'create') {
@@ -139,40 +169,55 @@ export function RecordDialog({ target, onClose }: { target: RecordTarget | null;
   } else if (target?.mode === 'edit-entry') {
     body = entryQuery.isPending ? <div className="loading">Cargando…</div>
       : entryQuery.isError ? <div className="errorbox">{(entryQuery.error as ApiError).title}</div>
-      : <RecordFormBody key={`e-${entryQuery.data.id}-${entryQuery.data.version}`} initial={fromEntry(entryQuery.data)} editId={entryQuery.data.id} onClose={onClose} reload={() => entryQuery.refetch()} />;
+      : <RecordFormBody key={`e-${entryQuery.data.id}-${entryQuery.data.version}`} initial={fromEntry(entryQuery.data)} editId={entryQuery.data.id} entry={entryQuery.data} onClose={onClose} reload={() => entryQuery.refetch()} onShowPayments={setPayments} />;
   } else if (target?.mode === 'edit-plan') {
     body = planQuery.isPending ? <div className="loading">Cargando…</div>
       : planQuery.isError ? <div className="errorbox">{(planQuery.error as ApiError).title}</div>
-      : <RecordFormBody key={`p-${planQuery.data.id}-${planQuery.data.version}`} initial={fromPlan(planQuery.data)} editId={planQuery.data.id} plan={planQuery.data} onClose={onClose} reload={() => planQuery.refetch()} />;
+      : <RecordFormBody key={`p-${planQuery.data.id}-${planQuery.data.version}`} initial={fromPlan(planQuery.data)} editId={planQuery.data.id} plan={planQuery.data} onClose={onClose} reload={() => planQuery.refetch()} onShowPayments={setPayments} />;
   }
 
   return (
-    <Modal open={open} title={title} onClose={onClose}>
-      {body}
-    </Modal>
+    <>
+      <Modal open={open} title={title} onClose={onClose}>
+        {body}
+      </Modal>
+      <PaymentHistoryDialog target={payments} onClose={() => setPayments(null)} />
+    </>
   );
 }
 
-export function RecordFormBody({ initial, editId, plan, onClose, reload, initialErrors = {} }: {
+export function RecordFormBody({ initial, editId, plan, entry, onClose, reload, onShowPayments, initialErrors = {}, initialFailure }: {
   initial: FormState;
   editId?: string;
   plan?: Plan;
+  entry?: Entry;
   onClose: () => void;
   reload?: () => void;
+  /** Abre la lista de pagos del registro (para revertirlos). */
+  onShowPayments?: (target: PaymentHistoryTarget) => void;
   /** Errores de campo con los que arranca el formulario (se usa en las pruebas de accesibilidad). */
   initialErrors?: FieldErrors<keyof FormState>;
+  /** Resultado de un guardado fallido con el que arranca el formulario (se usa en las pruebas). */
+  initialFailure?: SaveFailure;
 }) {
   const qc = useQueryClient();
   const { toast } = useUi();
   const [f, setF] = useState<FormState>(initial);
-  const [errors, setErrors] = useState<FieldErrors<keyof FormState>>(initialErrors);
-  const [formError, setFormError] = useState<string | null>(null);
-  const [conflict, setConflict] = useState(false);
+  const [errors, setErrors] = useState<FieldErrors<keyof FormState>>(initialFailure?.fields ?? initialErrors);
+  const [formError, setFormError] = useState<string | null>(initialFailure?.form ?? null);
+  const [conflict, setConflict] = useState(initialFailure?.conflict ?? false);
+  const [paymentsApplied, setPaymentsApplied] = useState(initialFailure?.paymentsApplied ?? false);
   const [saving, setSaving] = useState(false);
   const accounts = useAccounts();
   const categories = useCategories();
   const plan_ = isPlan(f.type);
   const scheduleLocked = !!plan?.hasPayments;
+  // Gasto con tarjeta con pagos aplicados: el servidor rechaza cambiar moneda, tarjeta o tipo, o bajar el importe
+  // por debajo de lo pagado (EntryEndpoints.Update). Se bloquea acá también para no llegar a ese error.
+  const entryPaid = entry ? BigInt(entry.paidMinor) : 0n;
+  const paymentsLocked = entryPaid > 0n;
+  const paymentsTarget = !editId ? null : plan ? paymentsOfPlan(plan.id, plan.concept) : paymentsOfEntry(editId, initial.concept);
+  const showPayments = paymentsTarget && onShowPayments ? () => onShowPayments(paymentsTarget) : null;
 
   const set = <K extends keyof FormState>(k: K, v: FormState[K]) => setF((s) => ({ ...s, [k]: v }));
 
@@ -196,6 +241,8 @@ export function RecordFormBody({ initial, editId, plan, onClose, reload, initial
     if (!f.concept.trim()) e.concept = ['El concepto es obligatorio.'];
     const amount = parseAmountInput(f.amount);
     if (!amount.ok) e.amount = [amount.error];
+    else if (paymentsLocked && BigInt(amount.minor) < entryPaid)
+      e.amount = [`No puede ser menor que lo ya pagado (${formatMoney(entryPaid, f.currency)}). Para bajarlo, primero revertí pagos.`];
     if (!f.date) e.date = ['La fecha no es válida.'];
     if (f.accountId === NEW_ACCOUNT && !f.newAccountName.trim()) e.newAccountName = ['Poné un nombre a la cuenta.'];
     if (plan_) {
@@ -221,6 +268,7 @@ export function RecordFormBody({ initial, editId, plan, onClose, reload, initial
     if (saving) return;
     setFormError(null);
     setConflict(false);
+    setPaymentsApplied(false);
     if (!validate()) return;
     setSaving(true);
     let fieldMap = RECORD_FIELD_MAP;
@@ -268,20 +316,16 @@ export function RecordFormBody({ initial, editId, plan, onClose, reload, initial
       toast(editId ? 'Cambios guardados' : 'Registro guardado');
       onClose();
     } catch (err) {
-      if (err instanceof ApiError) {
-        if (err.status === 409) {
-          setConflict(true);
-          // Las listas pueden tener la versión vieja: se recargan desde el servidor.
-          // El formulario abierto NO se recarga solo: la persona decide si carga la versión actual.
-          void qc.invalidateQueries({ predicate: (q) => !['me', 'entry', 'plan'].includes(String(q.queryKey[0])) });
-        }
-        // Cada mensaje va junto a su campo; las claves sin campo (p. ej. version) se suman al mensaje general.
-        const { fields, other } = mapFieldErrors(err.fieldErrors, fieldMap);
-        setErrors(fields);
-        setFormError([err.title, ...other].join(' '));
-      } else {
-        setFormError('No se pudo guardar. Probá de nuevo.');
+      const failure = saveFailure(err, fieldMap);
+      if (failure.conflict || failure.paymentsApplied) {
+        // Las listas pueden estar viejas (otra versión, o pagos que no se veían): se recargan desde el servidor.
+        // El formulario abierto NO se recarga solo: la persona decide si carga la versión actual o revisa los pagos.
+        void qc.invalidateQueries({ predicate: (q) => !['me', 'entry', 'plan'].includes(String(q.queryKey[0])) });
       }
+      setConflict(failure.conflict);
+      setPaymentsApplied(failure.paymentsApplied);
+      setErrors(failure.fields);
+      setFormError(failure.form);
     } finally {
       setSaving(false);
     }
@@ -329,6 +373,13 @@ export function RecordFormBody({ initial, editId, plan, onClose, reload, initial
           {fe.error('amountMode')}
         </>
       )}
+      {paymentsLocked && (
+        <div className="notice warn">
+          Este gasto tiene pagos aplicados por {formatMoney(entryPaid, initial.currency)}: la moneda y la tarjeta quedan fijas y el importe no puede
+          ser menor que lo pagado. Para cambiarlos, primero revertí esos pagos.
+          {showPayments && <> <button type="button" className="linkbtn" onClick={showPayments}>Ver pagos</button></>}
+        </div>
+      )}
       <div className="fields">
         <label>
           <span>{plan_ ? (f.amountMode === 'total' ? 'Total de todas las cuotas' : 'Importe de cada cuota') : 'Importe'}</span>
@@ -337,7 +388,7 @@ export function RecordFormBody({ initial, editId, plan, onClose, reload, initial
         </label>
         <label>
           Moneda
-          <select value={f.currency} disabled={scheduleLocked} onChange={(e) => setF((s) => ({ ...s, currency: e.target.value as Currency, accountId: '', disbursementAccountId: '' }))} {...fieldProps('currency')}>
+          <select value={f.currency} disabled={scheduleLocked || paymentsLocked} onChange={(e) => setF((s) => ({ ...s, currency: e.target.value as Currency, accountId: '', disbursementAccountId: '' }))} {...fieldProps('currency')}>
             <option>ARS</option>
             <option>USD</option>
           </select>
@@ -361,7 +412,7 @@ export function RecordFormBody({ initial, editId, plan, onClose, reload, initial
       </div>
       <label>
         Cuenta / tarjeta
-        <select value={f.accountId} onChange={(e) => set('accountId', e.target.value)} {...fieldProps('accountId')}>
+        <select value={f.accountId} disabled={paymentsLocked} onChange={(e) => set('accountId', e.target.value)} {...fieldProps('accountId')}>
           <option value="">Sin especificar</option>
           {accountOptions.map((a) => <option key={a.id} value={a.id}>{a.name}{a.kind === 'credit_card' ? ' (tarjeta)' : ''}</option>)}
           <option value={NEW_ACCOUNT}>＋ Nueva cuenta…</option>
@@ -403,7 +454,7 @@ export function RecordFormBody({ initial, editId, plan, onClose, reload, initial
             : <>Cada cuota es de {formatMoney(preview.parts[0]!, f.currency)}. Sin diferencia de redondeo.</>}
         </div>
       )}
-      {scheduleLocked && plan && <AdjustPending plan={plan} onDone={onClose} />}
+      {scheduleLocked && plan && <AdjustPending plan={plan} onDone={onClose} onShowPayments={showPayments} />}
       {plan_ && (
         <details className="more" open={f.ongoing !== 'none' || !!f.disbursement || ONGOING_FIELDS.some((k) => errors[k]?.length)}>
           <summary>{f.type === 'loan' ? 'Crédito ya en curso o capital recibido' : 'Compra ya en curso'}</summary>
@@ -455,14 +506,19 @@ export function RecordFormBody({ initial, editId, plan, onClose, reload, initial
         </label>
       </details>
       <p className="hint">{hint}</p>
-      {generalError && !conflict && <p className="formerror" role="alert">{generalError}</p>}
+      {generalError && !conflict && (
+        <p className="formerror" role="alert">
+          {generalError}
+          {paymentsApplied && showPayments && <> <button type="button" className="linkbtn" onClick={showPayments}>Ver pagos</button></>}
+        </p>
+      )}
       <button className="primary full" disabled={saving}>{saving ? 'Guardando…' : 'Guardar registro'}</button>
     </form>
   );
 }
 
 /** Con cuotas pagadas no se reescribe la historia: se ajusta explícitamente el total pendiente de las cuotas abiertas. */
-function AdjustPending({ plan, onDone }: { plan: Plan; onDone: () => void }) {
+function AdjustPending({ plan, onDone, onShowPayments }: { plan: Plan; onDone: () => void; onShowPayments: (() => void) | null }) {
   const qc = useQueryClient();
   const { toast } = useUi();
   const open = (plan.installments ?? []).filter((i) => i.status === 'pending');
@@ -472,7 +528,8 @@ function AdjustPending({ plan, onDone }: { plan: Plan; onDone: () => void }) {
   const [busy, setBusy] = useState(false);
   const errorId = `${useId()}err-pending`;
   useEffect(() => setValue(minorToInput(currentOpen.toString())), [currentOpen]);
-  if (open.length === 0) return <div className="notice">Todas las cuotas tienen pagos: no hay pendientes para ajustar.</div>;
+  const paymentsLink = onShowPayments && <> <button type="button" className="linkbtn" onClick={onShowPayments}>Ver pagos</button></>;
+  if (open.length === 0) return <div className="notice">Todas las cuotas tienen pagos: no hay pendientes para ajustar.{paymentsLink}</div>;
   const apply = async () => {
     const parsed = parseAmountInput(value);
     if (!parsed.ok) return setError(parsed.error);
@@ -491,8 +548,9 @@ function AdjustPending({ plan, onDone }: { plan: Plan; onDone: () => void }) {
   };
   return (
     <div className="notice warn">
-      Este plan tiene cuotas pagadas: el total, la cantidad y las fechas quedan bloqueados para no reescribir la historia.
-      Podés ajustar el total de las {open.length} cuotas sin pagos (desde el {formatDate(open[0]!.dueDate)}):
+      Este plan tiene cuotas pagadas: el total, la cantidad y las fechas quedan bloqueados para no reescribir la historia; para
+      cambiarlos, primero revertí los pagos.{paymentsLink}
+      {' '}Podés ajustar el total de las {open.length} cuotas sin pagos (desde el {formatDate(open[0]!.dueDate)}):
       <div className="inline">
         <label>
           Nuevo total pendiente

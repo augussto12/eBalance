@@ -1,5 +1,5 @@
 import { ApiError } from '../api/client';
-import type { Occurrence, PaymentAllocation, PaymentFilter } from '../api/types';
+import type { Occurrence, Page, Payment, PaymentAllocation, PaymentFilter } from '../api/types';
 
 /** Lista de pagos a mostrar: título del panel/modal y filtros de GET /payments. */
 export interface PaymentHistoryTarget {
@@ -9,16 +9,40 @@ export interface PaymentHistoryTarget {
 
 const FILTER_KEYS = ['planId', 'installmentId', 'entryId', 'targetAccountId', 'kind', 'currency'] as const;
 
-/** Ruta de GET /payments con los filtros indicados (los vacíos no se envían). */
-export function paymentsPath(filter: PaymentFilter): string {
+/** Página pedida a GET /payments (el servidor usa 50 por omisión y acepta hasta 200). */
+export interface PaymentPaging {
+  page: number;
+  pageSize: number;
+}
+
+/** Ruta de GET /payments con los filtros indicados (los vacíos no se envían) y, si se indica, la página. */
+export function paymentsPath(filter: PaymentFilter, paging?: PaymentPaging): string {
   const params = new URLSearchParams();
   for (const key of FILTER_KEYS) {
     const value = filter[key];
     if (value) params.set(key, value);
   }
   if (filter.includeReversed) params.set('includeReversed', 'true');
+  if (paging) {
+    params.set('page', String(paging.page));
+    params.set('pageSize', String(paging.pageSize));
+  }
   const query = params.toString();
   return query ? `/payments?${query}` : '/payments';
+}
+
+/** Página siguiente de GET /payments, o undefined si ya se cargaron todos (usa el tamaño que devolvió el servidor). */
+export function nextPaymentsPage(last: Page<Payment>): number | undefined {
+  return last.items.length > 0 && last.page * last.pageSize < last.total ? last.page + 1 : undefined;
+}
+
+/**
+ * Pagos de todas las páginas cargadas, en el orden del servidor y sin repetir: si entre una página y la siguiente se
+ * registró otro pago, el corrimiento trae de nuevo el último de la página anterior.
+ */
+export function loadedPayments(pages: readonly Page<Payment>[]): Payment[] {
+  const seen = new Set<string>();
+  return pages.flatMap((p) => p.items).filter((p) => !seen.has(p.id) && !!seen.add(p.id));
 }
 
 /** «Monitor · cuota 2 de 6» o «Cena · consumo con tarjeta». Siempre texto plano. */
@@ -38,7 +62,12 @@ export function occurrenceHasPayments(o: Occurrence): boolean {
 export function paymentsOfOccurrence(o: Occurrence): PaymentHistoryTarget {
   return o.source === 'installment'
     ? { title: `Pagos de la cuota ${o.installmentNumber} de ${o.installmentCount} · ${o.concept}`, filter: { installmentId: o.id } }
-    : { title: `Pagos de «${o.concept}»`, filter: { entryId: o.id } };
+    : paymentsOfEntry(o.id, o.concept);
+}
+
+/** Pagos de un consumo con tarjeta (al cambiar importe, moneda o tarjeta, o al eliminarlo, hay que revertirlos). */
+export function paymentsOfEntry(entryId: string, concept: string): PaymentHistoryTarget {
+  return { title: `Pagos de «${concept}»`, filter: { entryId } };
 }
 
 /** Pagos de un plan completo (al eliminarlo hay que revertir todos). */

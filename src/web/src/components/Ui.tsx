@@ -21,7 +21,7 @@ interface ConfirmOptions {
   danger?: boolean;
 }
 
-interface UiValue {
+export interface UiValue {
   me: Me;
   month: string;
   setMonth: (m: string) => void;

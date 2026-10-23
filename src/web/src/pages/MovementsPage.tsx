@@ -1,9 +1,10 @@
 import { useEffect, useState } from 'react';
-import { keepPreviousData, useQuery } from '@tanstack/react-query';
+import { useQuery } from '@tanstack/react-query';
 import { api } from '../api/client';
 import type { Occurrence, Page } from '../api/types';
-import { OccurrenceTable, QueryState, RefetchError } from '../components/Records';
+import { OccurrenceTable, Pager, QueryState, RefetchError, usePageClamp } from '../components/Records';
 import { useUi } from '../components/Ui';
+import { keepPreviousPage, pageCount } from '../lib/paging';
 
 const PAGE_SIZE = 25;
 
@@ -20,16 +21,19 @@ export function MovementsPage() {
   }, [search]);
   useEffect(() => setPage(1), [debounced, type, month, currency]);
 
-  const q = useQuery({
-    queryKey: ['movements', month, currency, debounced, type, page],
+  const queryKey = ['movements', month, currency, debounced, type, page];
+  const q = useQuery<Page<Occurrence>>({
+    queryKey,
     queryFn: ({ signal }) => {
       const params = new URLSearchParams({ month, currency, type, page: String(page), pageSize: String(PAGE_SIZE) });
       if (debounced) params.set('q', debounced);
       return api<Page<Occurrence>>('GET', `/movements?${params}`, undefined, { signal });
     },
-    placeholderData: keepPreviousData,
+    // Solo al cambiar de página se sigue viendo la anterior; con otro mes, moneda, tipo o búsqueda, «Cargando…».
+    placeholderData: keepPreviousPage(queryKey, 5),
   });
-  const pages = q.data ? Math.max(1, Math.ceil(q.data.total / PAGE_SIZE)) : 1;
+  const pages = q.data ? pageCount(q.data.total, PAGE_SIZE) : 1;
+  usePageClamp(page, pages, !!q.data && !q.isPlaceholderData, setPage);
 
   return (
     <section className="panel">
@@ -54,15 +58,7 @@ export function MovementsPage() {
           ) : (
             <OccurrenceTable rows={q.data.items} currency={currency} />
           )}
-          {q.data.total > PAGE_SIZE && (
-            <div className="pager">
-              <span>{q.data.total} movimientos · página {page} de {pages}</span>
-              <div>
-                <button disabled={page <= 1} onClick={() => setPage((p) => p - 1)}>‹ Anterior</button>
-                <button disabled={page >= pages} onClick={() => setPage((p) => p + 1)}>Siguiente ›</button>
-              </div>
-            </div>
-          )}
+          <Pager page={page} pages={pages} total={q.data.total} noun="movimientos" onPage={setPage} />
         </>
       ) : (
         <QueryState isPending={q.isPending} error={q.error} onRetry={() => q.refetch()} />

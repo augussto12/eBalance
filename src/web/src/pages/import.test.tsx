@@ -36,10 +36,13 @@ describe('confirmación de importación en modal', () => {
     expect(html).toContain('Mastercard (ARS)');
   });
 
-  it('sin registros nuevos la confirmación queda deshabilitada y el foco va a Cancelar', () => {
+  it('sin registros nuevos la confirmación queda deshabilitada y Cancelar lleva data-autofocus', () => {
+    // Que el foco vaya a ese botón aunque los selects de cuentas estén antes se prueba en components/modal.test.ts.
     const html = dialog(preview(0));
     expect(html).toMatch(/<button type="button" class="primary" disabled="">Confirmar importación<\/button>/);
     expect(html).toMatch(/<button type="button" data-autofocus="true">Cancelar<\/button>/);
+    expect(html.indexOf('<select')).toBeGreaterThan(-1);
+    expect(html.indexOf('<select')).toBeLessThan(html.indexOf('data-autofocus'));
     expect(text(html)).toContain('No hay registros nuevos para importar');
   });
 

@@ -1,7 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { ApiError } from '../api/client';
-import type { Occurrence, PaymentAllocation } from '../api/types';
-import { describeAllocation, isPaymentsApplied, occurrenceHasPayments, paymentsOfOccurrence, paymentsOfPlan, paymentsPath } from './payments';
+import type { Occurrence, Page, Payment, PaymentAllocation } from '../api/types';
+import {
+  describeAllocation, isPaymentsApplied, loadedPayments, nextPaymentsPage, occurrenceHasPayments, paymentsOfEntry, paymentsOfOccurrence,
+  paymentsOfPlan, paymentsPath,
+} from './payments';
 
 const allocation = (over: Partial<PaymentAllocation>): PaymentAllocation => ({
   installmentId: null, entryId: null, amountMinor: '100', planId: null, planKind: null, concept: 'Monitor',
@@ -20,6 +23,33 @@ describe('paymentsPath', () => {
     expect(paymentsPath({ planId: 'p-1', includeReversed: true })).toBe('/payments?planId=p-1&includeReversed=true');
     expect(paymentsPath({ kind: 'card', currency: 'USD', includeReversed: false })).toBe('/payments?kind=card&currency=USD');
     expect(paymentsPath({ entryId: 'a&b' })).toBe('/payments?entryId=a%26b');
+  });
+
+  it('agrega la página pedida (contrato paginado de GET /payments)', () => {
+    expect(paymentsPath({ kind: 'card', includeReversed: true }, { page: 2, pageSize: 50 })).toBe('/payments?kind=card&includeReversed=true&page=2&pageSize=50');
+    expect(paymentsPath({}, { page: 1, pageSize: 8 })).toBe('/payments?page=1&pageSize=8');
+  });
+});
+
+const payment = (id: string): Payment => ({
+  id, sourceAccountId: 'a', sourceAccountName: 'Banco', date: '2026-10-05', currency: 'ARS', amountMinor: '100', note: null, allocations: [],
+  version: 1, createdAt: '2026-10-05T12:00:00Z', reversedAt: null, deletedAt: null,
+});
+const pageOf = (page: number, pageSize: number, total: number, ids: string[]): Page<Payment> => ({ items: ids.map(payment), page, pageSize, total });
+
+describe('páginas del historial de pagos', () => {
+  it('pide la siguiente mientras falten pagos, con el tamaño que devolvió el servidor', () => {
+    expect(nextPaymentsPage(pageOf(1, 2, 5, ['a', 'b']))).toBe(2);
+    expect(nextPaymentsPage(pageOf(2, 2, 5, ['c', 'd']))).toBe(3);
+    expect(nextPaymentsPage(pageOf(3, 2, 5, ['e']))).toBeUndefined();
+    expect(nextPaymentsPage(pageOf(1, 50, 50, ['a']))).toBeUndefined();
+    // Una página vacía (se borraron pagos entre medio) no pide otra: no hay bucle.
+    expect(nextPaymentsPage(pageOf(4, 2, 9, []))).toBeUndefined();
+  });
+
+  it('une las páginas sin repetir el pago que se corrió de una página a la siguiente', () => {
+    expect(loadedPayments([pageOf(1, 2, 5, ['a', 'b']), pageOf(2, 2, 5, ['b', 'c'])]).map((p) => p.id)).toEqual(['a', 'b', 'c']);
+    expect(loadedPayments([])).toEqual([]);
   });
 });
 
@@ -43,6 +73,7 @@ describe('pagos de una fila de movimientos', () => {
     expect(paymentsOfOccurrence(occurrence({}))).toEqual({ title: 'Pagos de la cuota 2 de 6 · Monitor', filter: { installmentId: 'i-2' } });
     expect(paymentsOfOccurrence(occurrence({ source: 'entry', id: 'e-1', concept: 'Cena' }))).toEqual({ title: 'Pagos de «Cena»', filter: { entryId: 'e-1' } });
     expect(paymentsOfPlan('p-1', 'Monitor')).toEqual({ title: 'Pagos de «Monitor»', filter: { planId: 'p-1' } });
+    expect(paymentsOfEntry('e-1', 'Cena')).toEqual({ title: 'Pagos de «Cena»', filter: { entryId: 'e-1' } });
   });
 });
 
