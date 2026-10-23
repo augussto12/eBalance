@@ -1,6 +1,19 @@
 import { useEffect, useId, useRef, type ReactNode } from 'react';
 import type { FieldErrors } from '../lib/forms';
 
+/** Control marcado explícitamente para recibir el foco al abrir (p. ej. la acción principal o «Cancelar»). */
+export const AUTOFOCUS_SELECTOR = '[data-autofocus]:not([disabled])';
+/** Si no hay uno marcado: el primer campo habilitado. */
+export const FIELD_SELECTOR = 'input:not([type=hidden]):not([disabled]), select:not([disabled]), textarea:not([disabled])';
+
+/**
+ * Elemento que recibe el foco al abrir el modal. `data-autofocus` tiene prioridad: una sola lista de selectores en
+ * querySelector devolvería el primero en orden del documento (p. ej. un select que está antes del botón marcado).
+ */
+export function pickInitialFocus(root: Pick<ParentNode, 'querySelector'>): HTMLElement | null {
+  return root.querySelector<HTMLElement>(AUTOFOCUS_SELECTOR) ?? root.querySelector<HTMLElement>(FIELD_SELECTOR);
+}
+
 /**
  * Modal accesible sobre <dialog> nativo (mismo estilo que el prototipo): showModal() vuelve inerte el resto de la
  * página (foco atrapado), Escape cierra, y al cerrar el foco vuelve al elemento que lo abrió.
@@ -22,8 +35,7 @@ export function Modal({ open, title, onClose, children, busy = false }: {
     if (open && !d.open) {
       opener.current = document.activeElement;
       d.showModal();
-      const first = d.querySelector<HTMLElement>('[data-autofocus], input:not([type=hidden]):not([disabled]), select, textarea');
-      first?.focus();
+      pickInitialFocus(d)?.focus();
     } else if (!open && d.open) {
       d.close();
       (opener.current as HTMLElement | null)?.focus?.();
