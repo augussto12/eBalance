@@ -4,10 +4,21 @@
 #   sudo ./infra/scripts/install-nginx-site.sh NOMBRE [--force]        sitio completo (requiere certificado)
 #   sudo ./infra/scripts/install-nginx-site.sh --acme-only NOMBRE      solo :80 para el desafío http-01 (temporal)
 #   sudo ./infra/scripts/install-nginx-site.sh --remove-acme           quita el sitio temporal
+#   ./infra/scripts/install-nginx-site.sh --render NOMBRE [ACTUAL]     solo muestra el sitio que instalaría (no toca nada)
 # Variables: CERT_DIR (directorio con fullchain.pem/privkey.pem; por defecto /etc/letsencrypt/live/<nombre>),
 #            NO_IPV6=1 (omite «listen [::]»), NO_IPV6_443=1 (solo omite [::]:443), DEFAULT_443=1 (certificado de IP: este sitio es el default del 443).
+# Si no se indican, se conservan las del sitio ya instalado (o de ACTUAL con --render): sin «listen [::]:80» → NO_IPV6=1;
+# sin «listen [::]:443» → NO_IPV6_443=1; con default_server en el 443 → DEFAULT_443=1. Así reinstalar después de una
+# actualización no convierte este sitio en el default de IPv6 de otros proyectos. Para cambiarlas, indicalas (vacías o 0:
+# con IPv6 / sin default_server).
 source "$(dirname "$0")/lib.sh"
-load_env
+# --render no necesita .env (sin él, WEB_BIND por defecto).
+if [[ "${1:-}" != --render || -f .env ]]; then load_env; fi
+render_only=0
+if [[ "${1:-}" == --render ]]; then
+  render_only=1; shift
+  [[ "${1:-}" != -* ]] || die "Uso: install-nginx-site.sh --render NOMBRE [ACTUAL]"
+fi
 
 if [[ -d /etc/nginx/sites-available ]]; then avail=/etc/nginx/sites-available; enabled=/etc/nginx/sites-enabled
 else avail=/etc/nginx/conf.d; enabled=""; fi
@@ -54,7 +65,7 @@ case "${1:-}" in
       echo "# Temporal: solo el desafío http-01 de Let's Encrypt para $domain. Lo quita el instalador."
       echo "server {"
       echo "    listen 80;"
-      if [[ -z "${NO_IPV6:-}" ]]; then echo "    listen [::]:80;"; fi
+      if [[ "${NO_IPV6:-}" != 1 ]]; then echo "    listen [::]:80;"; fi
       echo "    server_name $domain;"
       echo "    location /.well-known/acme-challenge/ { root /var/www/certbot; default_type text/plain; }"
       echo "    location / { return 404; }"
@@ -82,12 +93,22 @@ cert_dir="${CERT_DIR:-/etc/letsencrypt/live/$domain}"
 [[ "$cert_dir" =~ ^/[A-Za-z0-9._/-]+$ ]] || die "CERT_DIR no válido"
 bind="${WEB_BIND:-127.0.0.1:8088}"
 target="$avail/$site"
+current="$target"
+if (( render_only )) && [[ -n "${2:-}" ]]; then current="$2"; fi
+# Las decisiones del sitio instalado se conservan si no se indican (ver el encabezado). «${VAR=1}» solo asigna si la
+# variable no está definida: el instalador las pasa siempre (vacías = con IPv6) y manda él.
+if [[ -f "$current" ]]; then
+  grep -q 'listen \[::\]:80' "$current" || : "${NO_IPV6=1}"
+  grep -q 'listen \[::\]:443' "$current" || : "${NO_IPV6_443=1}"
+  if grep -qE 'listen 443 ssl.*default_server' "$current"; then : "${DEFAULT_443=1}"; fi
+fi
 rendered="$(mktemp)"; trap 'rm -f "$rendered"' EXIT
 extra=()
-if [[ -n "${NO_IPV6:-}" ]]; then extra=(-e '/listen \[::\]/d')
-elif [[ -n "${NO_IPV6_443:-}" ]]; then extra=(-e '/listen \[::\]:443/d'); fi
+if [[ "${NO_IPV6:-}" == 1 ]]; then extra=(-e '/listen \[::\]/d')
+elif [[ "${NO_IPV6_443:-}" == 1 ]]; then extra=(-e '/listen \[::\]:443/d'); fi
 # «http2 on;» existe desde nginx 1.25.1; Ubuntu 24.04 trae 1.24 → se usa «listen 443 ssl http2».
-ngx_version="$(nginx -v 2>&1 | grep -o '[0-9][0-9.]*' | head -1 || true)"
+ngx_version=""
+if command -v nginx >/dev/null; then ngx_version="$(nginx -v 2>&1 | grep -o '[0-9][0-9.]*' | head -1 || true)"; fi
 if [[ "$(printf '%s\n1.25.1\n' "$ngx_version" | sort -V | head -1)" != 1.25.1 ]]; then
   extra+=(-e '/^ *http2 on;/d' -e 's/listen 443 ssl;/listen 443 ssl http2;/' -e 's/listen \[::\]:443 ssl;/listen [::]:443 ssl http2;/')
 fi
@@ -97,6 +118,7 @@ if [[ "${DEFAULT_443:-}" == 1 ]]; then
 fi
 sed -e "s#CERT-DIR#$cert_dir#g" -e "s/finanzas\.TU-DOMINIO/$domain/g" -e "s/127\.0\.0\.1:8088/$bind/g" \
   "${extra[@]}" infra/nginx/finanzas.conf > "$rendered"
+if (( render_only )); then cat "$rendered"; exit 0; fi
 if [[ -f "$target" ]] && ! cmp -s "$rendered" "$target" && [[ "${2:-}" != --force ]]; then
   diff -u "$target" "$rendered" || true
   die "$target ya existe con otro contenido. Revisá el diff y usá --force para reemplazarlo."

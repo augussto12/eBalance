@@ -34,7 +34,8 @@ case "$ntp_rc" in 0) ok "$msg" ;; 1) bad "$msg" ;; *) note "$msg" ;; esac
 if offsite_configured; then
   case "$OFFSITE_RESTIC_REPOSITORY" in
     /*|local:*) note "OFFSITE_RESTIC_REPOSITORY es una ruta local: no es una copia fuera de la VPS" ;;
-    sftp:*|rclone:*) bad "OFFSITE_RESTIC_REPOSITORY usa ${OFFSITE_RESTIC_REPOSITORY%%:*}, que la imagen de backup no incluye: usá s3:, b2:, azure:, gs:, swift: o rest: (RUNBOOK §4)" ;;
+    sftp:*|rclone:*) bad "OFFSITE_RESTIC_REPOSITORY usa ${OFFSITE_RESTIC_REPOSITORY%%:*}, que la imagen de backup no incluye: usá s3:, b2:, azure:, swift: o rest: (RUNBOOK §4)" ;;
+    gs:*) bad "OFFSITE_RESTIC_REPOSITORY usa gs:, que necesita un archivo de credenciales de Google que no se monta: para Google Cloud Storage usá su endpoint compatible con S3 (s3:https://storage.googleapis.com/BUCKET/alvarez) con claves HMAC (RUNBOOK §4)" ;;
     *) ok "copia externa configurada (${OFFSITE_RESTIC_REPOSITORY%%:*})" ;;
   esac
   if [[ -e "$OFFSITE_RESTIC_ENV_FILE" ]]; then
@@ -47,11 +48,13 @@ fi
 # Sitio del Nginx del host: se instala aparte (install-nginx-site.sh), así que un deploy no lo actualiza.
 for site in /etc/nginx/sites-available/zz-alvarez-finanzas.conf /etc/nginx/conf.d/zz-alvarez-finanzas.conf; do
   if [[ -f "$site" ]] && ! grep -q 'alvarez_ip_min' "$site"; then
-    note "$site es de una versión anterior (registra la IP completa): reinstalalo con install-nginx-site.sh NOMBRE --force (RUNBOOK §3)"
+    note "$site es de una versión anterior (registra la IP completa): reinstalalo con «CERT_DIR=… install-nginx-site.sh NOMBRE --force», que conserva sus listen [::] y default_server (RUNBOOK §3)"
   fi
 done
 [[ ! -e "$SECRETS_DIR/restic_password.previous" ]] \
   || note "rotación de restic sin confirmar: guardá la contraseña nueva fuera del servidor y corré rotate-secrets.sh restic-confirm"
+[[ ! -s "$SECRETS_DIR/restic-offsite-key-pending" ]] \
+  || note "la contraseña ANTERIOR de restic todavía abre el repositorio externo de solo agregar: quitá la clave desde otra máquina y corré rotate-secrets.sh restic-confirm (RUNBOOK §7)"
 
 compose_json="$(mktemp)"
 if dc config --format json >"$compose_json" 2>/dev/null; then

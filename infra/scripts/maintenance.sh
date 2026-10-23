@@ -27,6 +27,9 @@ age_of_last() {
 }
 age="$(age_of_last ' backup OK')"
 if [[ -z "$age" ]] || (( age > 2*86400 )); then fail "No hay backup exitoso en las últimas 48 h"; fi
+if grep ' backup OK' "$BACKUP_DIR/backup.log" 2>/dev/null | tail -1 | grep -q 'keyring=FALTA'; then
+  fail "El último backup no incluyó el key ring: el volumen de claves está vacío (RUNBOOK §5, restore.sh --keyring-only)"
+fi
 if offsite_configured; then
   age="$(age_of_last ' offsite=OK')"
   if [[ -z "$age" ]] || (( age > 2*86400 )); then fail "No hay copia exitosa al repositorio externo en las últimas 48 h"; fi
@@ -36,5 +39,8 @@ fi
 prev="$SECRETS_DIR/restic_password.previous"
 if [[ -e "$prev" ]] && (( $(date +%s) - $(stat -c %Y "$prev") > 7*86400 )); then
   warn "Rotación de restic sin confirmar hace más de 7 días: guardá la contraseña nueva y corré rotate-secrets.sh restic-confirm."
+fi
+if [[ -s "$SECRETS_DIR/restic-offsite-key-pending" ]]; then
+  warn "La contraseña ANTERIOR de restic todavía abre el repositorio externo (solo agregar): quitá la clave desde otra máquina y corré rotate-secrets.sh restic-confirm (RUNBOOK §7)."
 fi
 exit $status

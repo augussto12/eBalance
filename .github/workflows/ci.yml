@@ -57,6 +57,8 @@ jobs:
       - run: docker compose --env-file .env.example config -q
       - name: Logs de Nginx sin query string ni IP completa (contenedor web y sitio del host)
         run: infra/tests/nginx-logs.sh alvarez-finanzas-web:ci
+      - name: Scripts de backup en la imagen (key ring vacío, resolve-keyring, verificación externa > 64 KiB, claves de restic)
+        run: infra/tests/backup-ops.sh alvarez-finanzas-backup:ci
       - name: Escaneo de imágenes (Trivy fijado; falla con HIGH/CRITICAL corregibles fuera de infra/trivy-ignore.yaml)
         run: SCAN_BASE=1 infra/scripts/scan-images.sh ci
 
@@ -71,6 +73,8 @@ jobs:
             -x -P infra/scripts -S warning infra/scripts/*.sh infra/tests/*.sh infra/docker/*.sh infra/docker/postgres/*.sh infra/e2e/*.sh
       - name: Avisos de falla (alert.sh contra un receptor HTTPS local)
         run: infra/tests/alerts.sh
+      - name: Reinstalar el sitio de Nginx conserva listen [::] y default_server
+        run: infra/tests/nginx-site.sh
       - name: Unidades systemd válidas
         run: |
           mkdir -p "$RUNNER_TEMP/units"
