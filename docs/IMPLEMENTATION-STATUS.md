@@ -1,6 +1,6 @@
 # Estado de implementación
 
-Actualizado: 22/10/2026. Rama `implementacion-v1` del repo `augussto12/eBalance`. Todo se construyó y verificó en un contenedor cloud de desarrollo (Linux, Docker 29.9, .NET SDK 10.0.113, Node 22.22, Chromium 141.0.7390.37). **No se tocó la VPS.**
+Actualizado: 23/10/2026. Rama `implementacion-v1` del repo `augussto12/eBalance`. Todo se construyó y verificó en un contenedor cloud de desarrollo (Linux, Docker 29.9, .NET SDK 10.0.113, Node 22.22, Chromium 141.0.7390.37). **No se tocó la VPS.**
 
 ## Resumen honesto
 
@@ -8,13 +8,22 @@ La app funciona de punta a punta en local sobre el stack de producción: TLS →
 
 **No está lista para datos reales** hasta completar en la VPS: HTTPS real, `preflight.sh` en verde, copia de backup fuera del servidor y un `restore-test.sh` exitoso ahí (gates de `AGENTS.md`). No es una auditoría de seguridad: es una implementación con pruebas, que pueden no cubrir todo.
 
+**Auditoría contra la especificación (23/10/2026).** Fue independiente y multiagente, y verificó cada hueco: revisó unos 385 requisitos de docs/00–06 y `AGENTS.md`. El resultado inicial fue:
+- 262 hechos y probados;
+- 56 hechos sin prueba;
+- 46 parciales;
+- 2 faltantes;
+- 14 que dependen de la VPS o de una decisión del propietario.
+
+Se corrigieron los huecos del repositorio en cinco ramas: pagos y planes, claves y seguridad, detalles de UI, operación y documentación. Después hubo una revisión adversarial del resultado: confirmó 23 hallazgos, todos corregidos y probados (ver «Bugs encontrados»). Lo que sigue abierto está en «Pendiente».
+
 ## Fases
 
 | Fase | Estado | Evidencia |
 |---|---|---|
-| 1. Inventario, versiones, dominio exacto | Hecha | `docs/VERSIONES.md`; 45 pruebas unitarias |
+| 1. Inventario, versiones, dominio exacto | Hecha | `docs/VERSIONES.md`; 79 pruebas unitarias |
 | 2. UI React fiel a `reference/` | Hecha | CSS original portado sin cambios; diferencia de píxeles 1,1 % (1440×900) y 1,1 % (390×844) — ver abajo |
-| 3. Auth, MFA, sesiones, ownership, esquema | Hecha | 28 pruebas de integración contra PostgreSQL 18 real |
+| 3. Auth, MFA, sesiones, ownership, esquema | Hecha | 72 pruebas de integración contra PostgreSQL 18 real; filtro global por propietario como defensa adicional; key ring que falla cerrado |
 | 4. CRUD, cuotas, pagos, transferencias, resumen, proyección | Hecha | Integración + E2E |
 | 5. Importación del prototipo y exportación/restauración versionada | Hecha | Integración + E2E |
 | 6. Endurecimiento, imágenes, Compose, Nginx, backup/restore, docs | Hecha en local | Scripts ejecutados (ver abajo). Instalador de la VPS probado en un entorno que la simula; **despliegue en la VPS real pendiente** |
@@ -23,24 +32,30 @@ La app funciona de punta a punta en local sobre el stack de producción: TLS →
 
 | Comando | Resultado |
 |---|---|
-| `dotnet test --project tests/unit/AlvarezFinanzas.UnitTests` | 45/45 OK |
-| `dotnet test --project tests/integration/AlvarezFinanzas.IntegrationTests` | 28/28 OK (Testcontainers, `postgres:18.6-alpine3.24`) |
-| `npx vitest run` (src/web) | 19/19 OK |
+| `dotnet build AlvarezFinanzas.slnx -c Release` (advertencias = errores) | OK, 0 advertencias |
+| `dotnet test --project tests/unit/AlvarezFinanzas.UnitTests` | 79/79 OK |
+| `dotnet test --project tests/integration/AlvarezFinanzas.IntegrationTests` | 72/72 OK (Testcontainers, `postgres:18.6-alpine3.24`) |
+| `npx vitest run` (src/web) | 101/101 OK |
 | `npm run build` / `tsc --noEmit` (src/web) | OK, sin errores de tipos |
-| `./infra/e2e/run.sh` (Playwright, stack completo con TLS) | 11/11 OK |
+| `./infra/e2e/run.sh` (Playwright, stack completo con TLS) | 11/11 OK (23/10/2026, sobre el código final, con Chromium 141 del entorno) |
 | `./infra/scripts/preflight.sh` (stack E2E levantado) | Preflight OK (incluye TLS y `check-config`) |
 | `./infra/scripts/backup.sh` | OK (restic 0.19.1, `restic check` sin errores) |
 | `./infra/scripts/restore-test.sh` | resultado=OK, 15–19 s; «Coincide con producción»; TOTP descifrable 1/1 |
 | `./infra/scripts/restore.sh latest` (pérdida simulada) | OK: 6/6 movimientos recuperados; tablas a nombre del migrador; sesiones revocadas |
 | `./infra/scripts/restore.sh latest --with-keyring` | OK |
 | `./infra/scripts/rotate-secrets.sh db-app` y `keyring-cert` | OK: la API reconecta y el certificado anterior descifra las claves viejas |
+| `./infra/scripts/rotate-secrets.sh db-app db-migrator keyring-cert restic` + `restic-confirm` (despliegue de prueba) | OK: API sana, backup posterior con la clave nueva del migrador, restore-test con el certificado rotado (TOTP 1/1) |
+| `./infra/scripts/deploy.sh --rollback <tag>` (dos veces) y con un tag inexistente | OK con smoke tests y `.release-history`; el tag inexistente se rechaza antes de tocar nada |
+| `infra/tests/offsite-backup.sh` (copia externa contra rest-server con autenticación y contra un destino de solo agregar) | OK: credenciales validadas, copia incremental, `--verify-offsite` con un dump de 433 KB, rotación de restic en dos fases |
+| `restore.sh --keyring-only` tras simular la pérdida del volumen de claves | OK: vuelve el key ring anterior, la base no se toca; un backup con `/keys` vacío falla y no reemplaza al último key ring |
+| Escaneo de imágenes (Trivy fijado, en CI y con `infra/scripts/scan-images.sh`) | Sin HIGH/CRITICAL corregibles en api, web y backup; excepciones con vencimiento en `infra/trivy-ignore.yaml` (restic 0.19.1, upstream) |
 | `./infra/scripts/recover-owner.sh` (stdin) | OK: MFA reiniciado, sesiones revocadas, evento `cli.recover_owner` |
 | `./infra/scripts/maintenance.sh` | OK |
 | `dotnet list … package --vulnerable --include-transitive` | Sin vulnerabilidades |
 | `npm audit` (web y e2e) | 0 vulnerabilidades |
 | Modo desarrollo (`dotnet run` + `vite` con proxy) | Login por el proxy: OK |
-| GitHub Actions `ci` (run 39853251610) | backend, frontend, images y secrets: OK |
-| `vps-install.sh --inspect` y la instalación completa, en un entorno que simula la VPS (Ubuntu 24.04, nginx 1.24 del host, IP 31.97.241.220 redirigida a local con iptables, Pebble 2.10 como ACME) | OK, `TLS_MODE=auto` → IP. Certificado de IP (perfil `shortlived`) por http-01 con el sitio temporal, sitio final, build, migración, smoke tests, preflight con TLS **verificado** (cadena + IP), backup y restore-test (resultado=OK, 27 s). Re-ejecución sobre una instalación a medias y `--inspect` sobre una completa: OK. En `install.log` no hay montos ni secretos |
+| GitHub Actions `ci` (run 39898212594, commit b5ae0fb) | backend, frontend, scripts (shellcheck, alertas, systemd), images (Trivy, logs de Nginx) y secrets (gitleaks): OK |
+| `vps-install.sh --inspect` y la instalación completa, en un entorno que simula la VPS (Ubuntu 24.04, nginx 1.24 del host, IP pública de la VPS redirigida a local con iptables, Pebble 2.10 como ACME) | OK, `TLS_MODE=auto` → IP. Certificado de IP (perfil `shortlived`) por http-01 con el sitio temporal, sitio final, build, migración, smoke tests, preflight con TLS **verificado** (cadena + IP), backup y restore-test (resultado=OK, 27 s). Re-ejecución sobre una instalación a medias y `--inspect` sobre una completa: OK. En `install.log` no hay montos ni secretos |
 | Verificación externa del sitio instalado | HTTP/2 200 con CSP; `http://` → 301 a `https://`; Host o SNI ajenos → 421; `/api/v1/entries` sin sesión → 401; web solo en `127.0.0.1:8088` |
 | `install-nginx-site.sh` con `nginx -t` fallido, con otro sitio roto y `--acme-only`/`--remove-acme` | Restaura el sitio anterior sin recargar; no toca nada si `nginx -t` ya fallaba; el sitio temporal responde antes de pedir el certificado |
 | `certbot.sh` (Pebble): cambio de IP del mismo linaje, renovación no vencida y renovación forzada | Reemplaza el certificado sin intervención; sin renovación no recarga Nginx; con renovación recarga una vez |
@@ -110,22 +125,66 @@ Diferencias **intencionales** respecto del prototipo:
 
 ## Pendiente / no probado (no marcar en verde)
 
-1. **Despliegue en la VPS real:** nada se ejecutó allí todavía. Este entorno de desarrollo no tiene salida de red hacia la VPS, así que el instalador lo corre el propietario. Falta: el certificado de Let's Encrypt real (acá se usó Pebble, la CA de prueba oficial), la convivencia con los sitios reales del Nginx existente, el `nmap` externo y medir el RTO. HSTS solo si se usa un dominio propio dedicado.
-2. **Copia de backup fuera de la VPS** (`OFFSITE_RESTIC_REPOSITORY`): implementada, no probada. Falta elegir destino.
-3. CI: el primer run falló por un control demasiado ingenuo de «secretos en el bundle» (la palabra `password` de los formularios); se corrigió. El run 39853251610 pasó completo: backend, frontend, imágenes y gitleaks sobre todo el historial.
-4. `rotate-secrets.sh restic` y `db-migrator`: no ejecutados.
-5. Alertas fuera del servidor: solo hay unidades systemd que fallan; falta elegir canal (`OnFailure=`).
-6. Escaneo de imágenes de contenedor (Trivy/Grype): no ejecutado.
-7. La prueba de ingreso interactivo sobre un backup restaurado es manual (RUNBOOK §5).
-8. Accesibilidad: hay modal accesible, labels, foco y teclado, pero no se corrió una auditoría automática (axe) ni con lector de pantalla.
-9. Navegadores: E2E solo en Chromium. Safari/Firefox y celulares reales sin probar.
-10. Cifrado de conceptos/notas a nivel de aplicación: **no implementado** (opcional en la spec). Riesgo residual: un volcado de la base expone conceptos e importes en claro. El cifrado del volumen depende del proveedor de la VPS. Los backups sí van cifrados.
-11. Rendimiento con miles de registros y concurrencia real: no medidos más allá de las pruebas.
-12. Limitadores en memoria: válidos para una sola instancia de la API (así está desplegado).
-13. Retención de logs: limitada por tamaño, no por 30 días, salvo configurar journald (RUNBOOK §3).
+1. **Despliegue en la VPS real:** nada se ejecutó allí todavía, porque este entorno de desarrollo no tiene salida de red hacia la VPS y el instalador lo corre el propietario. Falta:
+   - el certificado de Let's Encrypt real (acá se usó Pebble, la CA de prueba oficial);
+   - la convivencia con los sitios y contenedores reales (por eso existe `vps-survey.sh`);
+   - el `nmap` externo;
+   - medir el RTO;
+   - repetir ahí `preflight.sh`, `backup.sh` y `restore-test.sh`.
+
+   HSTS solo con un dominio propio dedicado.
+2. **Destino de la copia externa:** decisión del propietario. Funciona y se probó contra un rest-server local, también en modo de solo agregar. No se probó con S3/B2 reales.
+3. **Destino de las alertas:** decisión del propietario. El mecanismo existe (`alert.sh`: webhook HTTPS o correo, nunca con contenido financiero) y se probó con un receptor local. Los timers y `OnFailure=` pasan `systemd-analyze verify`, pero no se vieron disparar bajo un systemd real.
+4. El ingreso interactivo sobre un backup restaurado es manual (RUNBOOK §5).
+5. Accesibilidad: hay modal accesible, labels, errores por campo, foco y teclado, pero no se corrió una auditoría automática (axe) ni con lector de pantalla.
+6. Navegadores: E2E solo en Chromium. Safari, Firefox y celulares reales sin probar. Los campos nativos de fecha y mes muestran el formato del idioma del navegador.
+7. Cifrado de conceptos y notas a nivel de aplicación: **no implementado** (opcional en la spec). Riesgo residual: un volcado de la base expone conceptos e importes en claro. Los backups sí van cifrados.
+8. No hay estado «conciliado» en los movimientos. El saldo cuenta todos los flujos registrados hasta hoy (nunca los futuros ni de otra moneda).
+9. Rendimiento con miles de registros y concurrencia real: no medidos más allá de las pruebas. Los limitadores en memoria valen para una sola instancia de la API, que es como está desplegado.
+10. Logs:
+    - la retención es por tamaño; los 30 días con journald son una opción documentada;
+    - el log de errores de Nginx no admite formato, así que ante un error del upstream registra la petición completa.
+11. Riesgos residuales documentados en `docs/ASVS-L2.md` (autoevaluación, no certificación):
+    - el bloqueo de cuenta puede provocarlo cualquiera que conozca el usuario;
+    - el administrador de la base o root pueden alterar la auditoría;
+    - restic 0.19.1 tiene hallazgos HIGH aceptados hasta 2027-01-31, a la espera de una versión upstream.
+12. El costo de PBKDF2 (≈159 ms por verificación) se midió en el contenedor de desarrollo; RUNBOOK indica cómo repetirlo en la VPS.
+13. Capas: `Application/Reports.cs` usa el `DbContext` directamente y `Domain` depende de ASP.NET Identity (patrón habitual; documentado).
 14. Fuera de alcance por especificación: CSV/PDF bancarios, notificaciones, tipos de cambio, presupuestos automáticos, recurrentes, passkeys.
 
 ## Bugs encontrados y corregidos durante la verificación
+
+Auditoría contra la especificación y revisión posterior (23/10/2026):
+
+- **Pagos:**
+  - No había forma de ver ni revertir un pago desde la app, así que un plan con pagos no se podía eliminar. Ahora existen el historial, la reversión con confirmación y versión, «Ver pagos» desde los errores y la paginación.
+  - Editar un plan después de revertir un pago daba 500. Ahora la edición se hace en el lugar y conserva el historial de asignaciones revertidas (migración nueva).
+  - Un pago con fecha futura bajaba el pendiente de la tarjeta antes que el saldo.
+  - Un pago concurrente con la eliminación del plan podía dejarlo borrado con pagos: ahora el pago sube la versión del plan.
+- **Importación v2:** un archivo editado podía mezclar monedas o crear transferencias inválidas. Ahora se valida igual que la API y se rechaza entero. Un fallo de serialización en el COMMIT daba 500.
+- **Saldo:** contaba movimientos futuros. Ahora cuenta hasta hoy en el calendario del propietario.
+- **API:**
+  - La restauración ignoraba la versión.
+  - La misma regla devolvía 400 en un endpoint y 422 en otro.
+  - Faltaba `GET /{id}` en cuentas y categorías.
+- **Claves:**
+  - Si se perdía el volumen de claves, Data Protection generaba claves nuevas en silencio. Ahora hay un centinela que hace fallar cerrado, `reset-key-ring` con confirmación y `restore.sh --keyring-only`.
+  - Un backup con `/keys` vacío pasaba a ser el «último» key ring.
+  - Rotar el certificado obligaba a guardar los anteriores para siempre. Ahora se vuelven a proteger el centinela y los TOTP con la clave actual.
+- **Operación:**
+  - La copia externa fallaba siempre con credenciales (`--env-file` no existe en `docker compose run`).
+  - `rotate-secrets.sh` rotaba solo el primer argumento, y rotar restic dejaba la copia externa ilegible.
+  - `--verify-offsite` se cortaba por SIGPIPE con dumps de más de 64 KiB.
+  - El Nginx del contenedor registraba las búsquedas (query string) y las IP completas.
+- **UI:**
+  - Las fechas y horas no salían en dd/MM/yyyy HH:mm.
+  - Faltaban errores por campo.
+  - La confirmación de importación no era un modal.
+  - Las contraseñas de más de 128 caracteres se truncaban en silencio.
+  - Había listas con datos viejos sin aviso al fallar una recarga.
+
+Antes:
+
 
 Revisión adversarial del instalador de la VPS (multiagente, con verificación independiente de cada hallazgo):
 
