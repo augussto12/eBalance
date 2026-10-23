@@ -1,6 +1,6 @@
 # API REST `/api/v1`
 
-Contrato de la API que usa el frontend (`src/web`). Está derivado del código del commit `6957687` (rama `implementacion-v1`), no de la especificación: si cambia un endpoint, este documento se actualiza en el mismo cambio. No hay OpenAPI ni Swagger a propósito (`src/api/AlvarezFinanzas.Api/AlvarezFinanzas.Api.csproj:6`), así que este archivo es el esquema documentado de los formularios y de las respuestas.
+Contrato de la API que usa el frontend (`src/web`). Está derivado del código, no de la especificación (primera versión: commit `6957687`, rama `implementacion-v1`; revisado después contra el código de la paginación e historial de pagos, la concurrencia entre pagos y planes, la restauración con versión y los códigos de estado unificados): si cambia un endpoint, este documento se actualiza en el mismo cambio. No hay OpenAPI ni Swagger a propósito (`src/api/AlvarezFinanzas.Api/AlvarezFinanzas.Api.csproj:6`), así que este archivo es el esquema documentado de los formularios y de las respuestas.
 
 Rutas de código citadas: `API/` = `src/api/AlvarezFinanzas.Api/`, `WEB/` = `src/web/src/`.
 
@@ -45,10 +45,11 @@ Las formas de error y los encabezados de las secciones 4 y 5 se observaron ejecu
 - **Propiedad:** el propietario sale siempre de la sesión. Un ID ajeno en la ruta da `404`, sin confirmar que exista. Una referencia ajena en el cuerpo (`accountId`, `categoryId`…) da `400` con el mensaje de «no existe» del campo (`API/Api/EntryEndpoints.cs:175-192`).
 - **PATCH reemplaza** todos los campos editables. No es una fusión parcial: un campo opcional omitido queda en `null`. Todos llevan `version` en el cuerpo.
 - **DELETE** es un borrado reversible (papelera). Lleva `?version=N`: si falta o no coincide, devuelve `409`.
-- **Restaurar:** `POST …/{id}/restore`, sin cuerpo ni versión.
+- **Restaurar:** `POST …/{id}/restore?version=N`, sin cuerpo. `N` es la versión actual del registro eliminado: la que devuelven el `DELETE` y `GET /trash` (o `GET /accounts?includeDeleted=true` y `GET /categories?includeDeleted=true` para lo archivado). **404** si el registro no está en la papelera o es ajeno; **409** con `current` si falta la versión o no coincide.
 - **Conflicto de versión:** `409` con el registro actual en `current`, para que el cliente muestre los datos vigentes.
 - **Orden de validación** en los endpoints con cuerpo: primero los datos (`400`), después la existencia y la propiedad (`404`), la versión (`409`) y por último las reglas de negocio (`409`/`422`).
-- **`Location`:** los `201 Created` devuelven `Location: /api/v1/<recurso>/{id}`. Solo `entries` y `plans` tienen `GET /{id}`. Para cuentas, categorías, pagos y transferencias, esa URL devuelve 404.
+- **`Location`:** los `201 Created` devuelven `Location: /api/v1/<recurso>/{id}`. Tienen `GET /{id}` `entries`, `plans`, `accounts` y `categories` (también lo eliminado o archivado). Para pagos y transferencias, esa URL devuelve 404.
+- **Pagos aplicados:** el `409` de una regla que protege pagos vigentes (editar el cronograma de un plan, o editar o eliminar un plan o un gasto con pagos) lleva además `"code":"payments_applied"`, para que el cliente ofrezca la lista de pagos a revertir (`GET /payments?planId=` o `?entryId=`).
 - **Idempotencia:** `POST /payments` y `POST /imports/{id}/commit` exigen el header `Idempotency-Key`: de 8 a 80 caracteres `[A-Za-z0-9_-]`. El frontend usa `crypto.randomUUID()` (`WEB/api/client.ts:148-150`).
 
 ## 2. Autenticación, sesión y niveles de acceso
@@ -117,8 +118,8 @@ El frontend guarda el token solo en memoria (`WEB/api/client.ts:41-59`).
 | Reautenticación | 5/min | `reauth:` + usuario | `AuthEndpoints.cs:337` |
 | Vista previa de importación y exportación | 5/h, cupo compartido | Usuario | `API/Api/ImportExportEndpoints.cs:40,453`; `App:ImportExportPerHour` |
 | Login en el Nginx del host | 30/min, ráfaga de 10 | IP | `infra/nginx/finanzas.conf:10,55-60` |
-| Paginación | `pageSize` de 1 a 100 (50 por defecto). Fuera de rango se ajusta, no da error | — | `API/Api/EntryEndpoints.cs:68-69`, `API/Api/ReportEndpoints.cs:119-120` |
-| Listas sin paginar | planes 500, pagos 200, transferencias 200, papelera 100 por tipo | — | ver cada endpoint |
+| Paginación | `page` desde 1; `pageSize` de 1 a 100 en `entries` y `movements`, de 1 a 200 en `payments` (50 por defecto). Fuera de rango se ajusta, no da error | — | `API/Api/EntryEndpoints.cs` (`List`), `API/Api/ReportEndpoints.cs` (`Movements`), `API/Api/CashEndpoints.cs` (`ListPayments`) |
+| Listas sin paginar | planes 500, transferencias 200, papelera 100 por tipo | — | ver cada endpoint |
 
 - **Respuesta 429:** los límites propios responden `429` con `Retry-After` en segundos y el título «Demasiados intentos. Esperá un momento y volvé a probar.» (`API/Api/ApiSupport.cs:127-131`).
 - **Alcance:** los limitadores viven en memoria y valen para **una sola instancia** de la API (`Security.cs:114-117`).
@@ -142,7 +143,7 @@ Todos los errores son `application/problem+json` (RFC 9457) con `correlationId`,
 | 403 | CSRF u origen | `code`: `"csrf"` |
 | 403 | Falta la elevación, o etapa de preauth equivocada | `title`: «Forbidden» o «Paso de autenticación no válido.» |
 | 404 | ID inexistente o ajeno, ruta inexistente, método no mapeado, GUID inválido en la ruta, `Content-Type` no JSON en un endpoint con cuerpo JSON (ver nota) | `title`: «No encontrado.» |
-| 409 | Versión distinta (`current` con el registro vigente), duplicado, regla que protege pagos aplicados, importación ya confirmada o caducada | `title` y, si aplica, `current` |
+| 409 | Versión distinta (`current` con el registro vigente), duplicado, regla que protege pagos aplicados (`code`: `"payments_applied"`), escritura simultánea que choca con otra (conflicto de serialización, también en el `COMMIT`), importación ya confirmada o caducada | `title` y, si aplica, `current` o `code` |
 | 413 | Archivo de importación mayor que `App:ImportMaxBytes` | `title`: «El archivo supera el tamaño máximo.» |
 | 415 | Vista previa de importación sin `application/json` | `title`: «El archivo debe ser JSON.» |
 | 422 | Regla de negocio sobre datos bien formados | `title` (en la vista previa, también `errors`: lista de textos) |
@@ -188,21 +189,23 @@ CSRF «sí» = header `X-CSRF-TOKEN` y `Origin`/`Referer` válidos (sección 3).
 | POST | `/auth/mfa/reset` | elevada | sí | 204 |
 | PATCH | `/auth/me` | sesión | sí | 200 |
 | GET | `/accounts` | sesión | no | 200 |
+| GET | `/accounts/{id}` | sesión | no | 200 |
 | POST | `/accounts` | sesión | sí | 201 |
 | PATCH | `/accounts/{id}` | sesión | sí | 200 |
 | DELETE | `/accounts/{id}?version=` | sesión | sí | 200 |
-| POST | `/accounts/{id}/restore` | sesión | sí | 200 |
+| POST | `/accounts/{id}/restore?version=` | sesión | sí | 200 |
 | GET | `/categories` | sesión | no | 200 |
+| GET | `/categories/{id}` | sesión | no | 200 |
 | POST | `/categories` | sesión | sí | 201 |
 | PATCH | `/categories/{id}` | sesión | sí | 200 |
 | DELETE | `/categories/{id}?version=` | sesión | sí | 200 |
-| POST | `/categories/{id}/restore` | sesión | sí | 200 |
+| POST | `/categories/{id}/restore?version=` | sesión | sí | 200 |
 | GET | `/entries` | sesión | no | 200 |
 | GET | `/entries/{id}` | sesión | no | 200 |
 | POST | `/entries` | sesión | sí | 201 |
 | PATCH | `/entries/{id}` | sesión | sí | 200 |
 | DELETE | `/entries/{id}?version=` | sesión | sí | 200 |
-| POST | `/entries/{id}/restore` | sesión | sí | 200 |
+| POST | `/entries/{id}/restore?version=` | sesión | sí | 200 |
 | POST | `/plans/preview` | sesión | sí | 200 |
 | GET | `/plans` | sesión | no | 200 |
 | GET | `/plans/{id}` | sesión | no | 200 |
@@ -211,15 +214,15 @@ CSRF «sí» = header `X-CSRF-TOKEN` y `Origin`/`Referer` válidos (sección 3).
 | PATCH | `/plans/{id}` | sesión | sí | 200 |
 | POST | `/plans/{id}/adjust-pending` | sesión | sí | 200 |
 | DELETE | `/plans/{id}?version=` | sesión | sí | 200 |
-| POST | `/plans/{id}/restore` | sesión | sí | 200 |
+| POST | `/plans/{id}/restore?version=` | sesión | sí | 200 |
 | GET | `/obligations` | sesión | no | 200 |
-| GET | `/payments` | sesión | no | 200 |
+| GET | `/payments` (paginado) | sesión | no | 200 |
 | POST | `/payments` (+ `Idempotency-Key`) | sesión | sí | 201 (200 si se repite) |
 | DELETE | `/payments/{id}?version=` | sesión | sí | 200 |
 | GET | `/transfers` | sesión | no | 200 |
 | POST | `/transfers` | sesión | sí | 201 |
 | DELETE | `/transfers/{id}?version=` | sesión | sí | 200 |
-| POST | `/transfers/{id}/restore` | sesión | sí | 200 |
+| POST | `/transfers/{id}/restore?version=` | sesión | sí | 200 |
 | GET | `/dashboard` | sesión | no | 200 |
 | GET | `/projection` | sesión | no | 200 |
 | GET | `/movements` | sesión | no | 200 |
@@ -347,14 +350,16 @@ Los endpoints de datos se registran en `API/Program.cs:247-257`. Todos los de se
 
 **DTO `Account`:**
 
-`{"id","name","kind":"cash"|"bank"|"wallet"|"credit_card","currency","last4":string|null,"openingBalanceMinor":signedMinor|null,"openingDate":date|null,"version","deletedAt":timestamp|null,"cashBalanceMinor":signedMinor|null,"pendingObligationsMinor":minor|null}` (`:34-47`)
+`{"id","name","kind":"cash"|"bank"|"wallet"|"credit_card","currency","last4":string|null,"openingBalanceMinor":signedMinor|null,"openingDate":date|null,"version","deletedAt":timestamp|null,"cashBalanceMinor":signedMinor|null,"cashBalanceAsOf":date|null,"pendingObligationsMinor":minor|null}` (`AccountDto`)
 
-Los dos campos calculados solo vienen en `GET /accounts`; en las demás respuestas son `null`.
+Los campos calculados vienen en `GET /accounts` y `GET /accounts/{id}`; en las demás respuestas son `null`. Los dos usan la misma regla «hasta hoy», con el día de hoy en la zona horaria del propietario (`API/Application/Reports.cs`, `BalanceService`):
 
-- `cashBalanceMinor`: saldo de caja (apertura + flujos desde la fecha de apertura). Solo para cuentas que no son tarjeta y tienen apertura.
-- `pendingObligationsMinor`: solo tarjetas. Suma las cuotas pendientes de sus planes y los gastos impagos cargados a ella (`API/Application/Reports.cs:81-140`).
+- `cashBalanceMinor`: saldo de caja al día `cashBalanceAsOf` = apertura + flujos desde la fecha de apertura y hasta hoy. Un gasto, pago, transferencia o acreditación con fecha futura todavía no cuenta. Solo para cuentas que no son tarjeta y tienen apertura; sin apertura, `null`.
+- `pendingObligationsMinor`: solo tarjetas. Cuotas pendientes de sus planes + gastos impagos cargados a ella − lo pagado **hasta hoy**: lo que asignó un pago con fecha futura sigue contando como pendiente hasta esa fecha (su importe tampoco salió todavía de la cuenta de origen), así ese dinero nunca falta de los dos lados. `GET /obligations`, en cambio, ya lo descuenta: muestra lo que falta pagar.
 
 **`GET /accounts?includeDeleted=bool`** → `Account[]`, ordenadas por nombre y moneda.
+
+**`GET /accounts/{id}`** → `Account` con los campos calculados, también si está archivada. **404** si no existe o es ajena.
 
 **`POST /accounts`** (`:64-99`)
 
@@ -374,11 +379,11 @@ Respuesta: **201** `Account`.
 - `kind` y `currency` **se ignoran**: no se pueden cambiar.
 - `last4` y el saldo inicial se reemplazan, y si se omiten quedan en `null`.
 - Respuesta: **200** `Account`.
-- Errores: **404**; **409** (versión o nombre duplicado); **422** («Las tarjetas no llevan saldo inicial.»).
+- Errores: **404**; **409** (versión o nombre duplicado); **400** en `openingBalanceMinor` si la cuenta es una tarjeta («Las tarjetas no llevan saldo inicial…»), con la misma regla y el mismo código que al crearla.
 
 **`DELETE /accounts/{id}?version=N`** (`:125-135`). Archiva la cuenta: los registros que la usan conservan la referencia. **200** `Account` con `deletedAt`. Errores: **404**, **409**.
 
-**`POST /accounts/{id}/restore`** (`:137-150`). **200**. Errores: **404** (la cuenta no está archivada); **409** (ya hay otra cuenta activa con ese nombre y moneda).
+**`POST /accounts/{id}/restore?version=N`** (`RestoreAccount`). **200**. Errores: **404** (la cuenta no está archivada o es ajena); **409** con `current` (falta la versión o no coincide); **409** (ya hay otra cuenta activa con ese nombre y moneda).
 
 ### 7.3 Categorías (`API/Api/CatalogEndpoints.cs:152-220`)
 
@@ -387,6 +392,8 @@ Respuesta: **201** `Account`.
 El servidor no exige que `kind` coincida con el tipo del movimiento que usa la categoría.
 
 **`GET /categories?includeDeleted=bool`** → `Category[]`, por nombre.
+
+**`GET /categories/{id}`** → `Category`, también si está archivada. **404** si no existe o es ajena.
 
 **`POST /categories`**
 
@@ -399,7 +406,7 @@ Respuesta: **201**.
 
 **`PATCH /categories/{id}`** → `name` (obligatorio), `kind` (opcional; si se omite se conserva) y `version` (obligatorio). **200**. Errores: **404**, **409**.
 
-**`DELETE /categories/{id}?version=N`** y **`POST /categories/{id}/restore`**: igual que en cuentas.
+**`DELETE /categories/{id}?version=N`** y **`POST /categories/{id}/restore?version=N`**: igual que en cuentas (al restaurar, **409** si ya hay otra categoría activa con ese nombre).
 
 ### 7.4 Movimientos simples (`API/Api/EntryEndpoints.cs`)
 
@@ -441,13 +448,13 @@ Respuesta: **201** `Entry`.
 
 - **200** `Entry`.
 - **404**; **409** de versión.
-- **409** si el gasto tiene pagos aplicados y se intenta bajar el importe por debajo de lo pagado o cambiar moneda, cuenta o tipo.
+- **409** con `code: "payments_applied"` si el gasto tiene pagos aplicados y se intenta bajar el importe por debajo de lo pagado o cambiar moneda, cuenta o tipo.
 
 **`DELETE /entries/{id}?version=N`** (`:151-161`). **200**.
 
-- **409** si tiene pagos aplicados: primero hay que revertir los pagos.
+- **409** con `code: "payments_applied"` si tiene pagos aplicados: primero hay que revertir los pagos.
 
-**`POST /entries/{id}/restore`.** **200**. Error: **404**.
+**`POST /entries/{id}/restore?version=N`.** **200**. Errores: **404** (no está en la papelera o es ajeno); **409** con `current` (falta la versión o no coincide).
 
 ### 7.5 Cuotas y préstamos (`API/Api/PlanEndpoints.cs`)
 
@@ -488,7 +495,7 @@ Distribución exacta: base = total DIV n, y las primeras (total MOD n) cuotas ll
 **`POST /plans/preview`** (`:110-127`) recibe `{amountMode, amountMinor, count, firstDueDate}`, con las mismas reglas.
 
 - **200:** `{"totalMinor","count","baseMinor","remainderMinor","installments":[{"number","amountMinor","dueDate"}]}`.
-- **400**; **422** si la última cuota queda fuera de rango.
+- **400**: datos, o `errors.firstDueDate` si la última cuota queda fuera de rango (la misma regla y el mismo código que al crear o editar el plan).
 - No escribe nada.
 - El frontend actual no lo usa: calcula la vista previa localmente con las mismas reglas (`WEB/components/RecordForm.tsx:160`), y el servidor recalcula al guardar.
 
@@ -505,11 +512,13 @@ Distribución exacta: base = total DIV n, y las primeras (total MOD n) cuotas ll
 
 **`POST /plans`** → **201** `Plan` con cuotas.
 
-**`PATCH /plans/{id}`** (`:229-274`). **200** `Plan`.
+**`PATCH /plans/{id}`** (`Update`). **200** `Plan`.
 
-- Con cuotas pagadas, no se puede cambiar total, cantidad, primera fecha, moneda ni `paidBeforeCount`: devuelve **409** con «Usá «Ajustar pendientes»».
-- Sí se pueden cambiar concepto, nota, cuenta, categoría y desembolso.
+- Con pagos vigentes aplicados a alguna cuota, no se puede cambiar total, cantidad, primera fecha, moneda ni `paidBeforeCount`: devuelve **409** con `code: "payments_applied"` («…Usá «Ajustar pendientes» o revertí los pagos.»). Las cuotas declaradas pagadas no cuentan como pagos.
+- Sin pagos vigentes (nunca pagado, o con todos sus pagos revertidos) el cronograma se recalcula: las cuotas que siguen existiendo conservan su fila y las que sobran se eliminan. Un pago revertido conserva todas sus asignaciones; la de una cuota que deja de existir queda con `installmentId: null` y conserva `planId` e `installmentNumber` (ver 7.6).
+- Sí se pueden cambiar siempre concepto, nota, cuenta, categoría y desembolso.
 - Errores: **404**, **409** de versión, **422** si cambia el tipo.
+- **Versión y pagos:** registrar o revertir un pago a una cuota del plan también sube la `version` del plan (el pago escribe la fila del plan en su misma transacción). Un `PATCH`, `adjust-pending` o `DELETE` con la versión de antes del pago da **409** con `current`; así un borrado o una edición que se cruza con un pago en curso nunca deja un plan eliminado con pagos vigentes.
 
 **`POST /plans/{id}/adjust-pending`** (`:277-301`)
 
@@ -522,11 +531,11 @@ Distribución exacta: base = total DIV n, y las primeras (total MOD n) cuotas ll
 - **404**; **409** de versión.
 - **422** en cualquiera de estos casos: no hay cuotas abiertas, el total es menor que la cantidad de cuotas abiertas, o el nuevo total supera el máximo.
 
-**`DELETE /plans/{id}?version=N`** (`:304-316`). **200**.
+**`DELETE /plans/{id}?version=N`** (`Delete`). **200**.
 
-- **409** si el plan tiene pagos aplicados: los pagos nunca se destruyen sin revertirlos explícitamente.
+- **409** con `code: "payments_applied"` si el plan tiene pagos aplicados: los pagos nunca se destruyen sin revertirlos explícitamente.
 
-**`POST /plans/{id}/restore`.** **200**. Error: **404**.
+**`POST /plans/{id}/restore?version=N`.** **200**. Errores: **404** (no está en la papelera o es ajeno); **409** con `current` (falta la versión o no coincide).
 
 ### 7.6 Obligaciones y pagos (`API/Api/CashEndpoints.cs`)
 
@@ -540,11 +549,32 @@ Respuesta **200**, ordenada por vencimiento:
 
 `[{"type":"installment"|"entry","id":uuid,"concept","dueDate","amountMinor","pendingMinor","planId":uuid|null,"number":int|null,"count":int|null}]`
 
-**DTO `Payment`** (`:75-87`):
+**DTO `Payment`** (`PaymentDto`):
 
-`{"id","sourceAccountId","sourceAccountName","date","currency","amountMinor","note","allocations":[{"installmentId":uuid|null,"entryId":uuid|null,"amountMinor"}],"version","deletedAt"}`
+`{"id","sourceAccountId","sourceAccountName","date","currency","amountMinor","note","allocations":Allocation[],"version","createdAt":timestamp,"reversedAt":timestamp|null,"deletedAt":timestamp|null}`
 
-**`GET /payments?from=&to=&accountId=`** → `Payment[]`, sin los revertidos, como máximo 200, por fecha descendente.
+**`Allocation`:** `{"installmentId":uuid|null,"entryId":uuid|null,"amountMinor","planId":uuid|null,"planKind":"card"|"loan"|null,"concept":string|null,"installmentNumber":int|null,"installmentCount":int|null,"dueDate":date|null}`
+
+- Cada asignación dice qué canceló: una cuota (plan, número de cuota de `installmentCount`, vencimiento) o un gasto con tarjeta (`entryId`, su concepto y su fecha). Vienen ordenadas por vencimiento y número.
+- `reversedAt` (igual a `deletedAt`) es la fecha de reversión. Un pago revertido conserva su fila y **todas** sus asignaciones: `amountMinor` siempre es la suma de sus asignaciones.
+- Si después de revertir el pago se acortó el plan y la cuota dejó de existir, la asignación queda con `installmentId: null` y conserva `planId`, `planKind`, `concept` e `installmentNumber`; `installmentCount` y `dueDate` vienen en `null`.
+
+**`GET /payments`** (`ListPayments`) → `{"items":Payment[],"page":int,"pageSize":int,"total":int}`, como `GET /entries`, ordenado por `date`, `createdAt` e `id` descendentes (orden estable entre páginas). `total` cuenta todos los pagos que cumplen los filtros.
+
+| Query | Tipo | Efecto |
+|---|---|---|
+| `from`, `to` | date | Fecha del pago, rango inclusivo |
+| `accountId` | uuid | Cuenta de origen |
+| `planId` | uuid | Pagos con alguna asignación a cuotas de ese plan, incluidas las cuotas que ya no existen (pagos revertidos) |
+| `installmentId` | uuid | Pagos con alguna asignación a esa cuota |
+| `entryId` | uuid | Pagos con alguna asignación a ese gasto con tarjeta |
+| `targetAccountId` | uuid | Tarjeta pagada: cuotas de planes cargados a ella o gastos cargados a ella |
+| `kind` | `card` o `loan` | `card`: cuotas de planes de tarjeta y gastos con tarjeta; `loan`: cuotas de préstamos. Otro valor da **400** |
+| `currency` | currency | |
+| `includeReversed` | bool | `true` incluye los revertidos; por defecto solo los vigentes |
+| `page`, `pageSize` | int | 1 y 50 por defecto; `pageSize` máximo 200. Fuera de rango se ajusta (una página después de la última viene vacía, con el `total`). Un valor que no es entero da **400** |
+
+Un filtro con formato inválido (`from`, `to`, `currency`, `kind`) da **400** por campo.
 
 **`POST /payments`** (`:106-228`). Header obligatorio `Idempotency-Key`. Todo el pago se aplica en una transacción `Serializable`.
 
@@ -560,7 +590,7 @@ Respuesta **200**, ordenada por vencimiento:
 | `note` | string | Opcional, hasta 200 caracteres |
 
 - Tiene que venir al menos uno de `targetAccountId`, `planId` o `allocations`.
-- **Sin `allocations`**, el importe se aplica a las obligaciones más antiguas del plan (si vino `planId`) o de la tarjeta. Si sobra importe, **400** en `amountMinor`.
+- **Sin `allocations`**, el importe se aplica a las obligaciones más antiguas del plan (si vino `planId`) o de la tarjeta. Si sobra importe, **422**: la misma regla y el mismo código que una asignación explícita que supera lo pendiente.
 - **Idempotencia:**
   - la misma clave con el mismo cuerpo devuelve **200** con el pago ya registrado, aunque después se haya revertido;
   - la misma clave con otro cuerpo devuelve **422**.
@@ -568,13 +598,13 @@ Respuesta **200**, ordenada por vencimiento:
 Respuestas:
 
 - **201** `Payment`.
-- **400**: datos o referencias.
-- **422**: asignaciones que no coinciden con el importe o lo pendiente, o cuotas o gastos inexistentes o de otra moneda.
-- **409**: «Otro cambio se guardó al mismo tiempo…» (conflicto de serialización); reintentar con la misma clave.
+- **400** por campo: datos y `Idempotency-Key` (`idempotencyKey`); cuenta de origen inexistente, ajena, de otra moneda o tarjeta (`sourceAccountId`); `targetAccountId` que no es una tarjeta propia; plan inexistente o ajeno (`planId`); y en `allocations`, cuotas o gastos inexistentes, ajenos, de otra moneda o (gastos) no cargados a una tarjeta. Igual que cualquier otra referencia.
+- **422**: asignaciones que no suman el importe o que superan lo pendiente (también la asignación automática), o clave de idempotencia repetida con otro cuerpo.
+- **409**: «Otro cambio se guardó al mismo tiempo…»: choque con otra escritura simultánea (conflicto de serialización al leer, al guardar o en el `COMMIT`; nunca 500). No se guardó nada; reintentar con la misma clave.
 
-El pago reduce la caja de la cuenta origen y el pendiente de las obligaciones. **No** crea un segundo gasto presupuestario.
+El pago reduce la caja de la cuenta origen y el pendiente de las obligaciones. **No** crea un segundo gasto presupuestario. También sube la `version` de cada plan cuyas cuotas paga (ver 7.5). Un pago con fecha futura ya se descuenta en `GET /obligations` (lo que falta pagar), pero no mueve la caja ni baja `pendingObligationsMinor` hasta su fecha (ver 7.2).
 
-**`DELETE /payments/{id}?version=N`** (`:237-276`). Revierte el pago: devuelve el pendiente a cada obligación y conserva el registro como eliminado. **200** `Payment`. Errores: **404**, **409**. No se puede restaurar.
+**`DELETE /payments/{id}?version=N`** (`ReversePayment`). Revierte el pago: devuelve el pendiente a cada obligación, sube la `version` de los planes afectados y conserva el registro con `reversedAt` y todas sus asignaciones. **200** `Payment`. Errores: **404** (no existe, es ajeno o ya está revertido); **409** (versión distinta, o choque con otra escritura simultánea). No se puede restaurar.
 
 ### 7.7 Transferencias (`API/Api/CashEndpoints.cs:278-345`)
 
@@ -594,7 +624,7 @@ El pago reduce la caja de la cuenta origen y el pendiente de las obligaciones. *
 
 Respuesta: **201**. Una transferencia es una sola fila, sin efecto presupuestario.
 
-**`DELETE /transfers/{id}?version=N`** y **`POST /transfers/{id}/restore`**: igual que en cuentas.
+**`DELETE /transfers/{id}?version=N`** y **`POST /transfers/{id}/restore?version=N`**: igual que en cuentas.
 
 ### 7.8 Resumen, proyección, movimientos y papelera (`API/Api/ReportEndpoints.cs`)
 
@@ -616,7 +646,7 @@ En las cuotas, `id` es el de la cuota y `version` el del plan.
 | `GET /dashboard` | **`month`**, **`currency`** | `{"month","currency","totals":MonthTotals,"series":MonthTotals[6],"categories":[{"name","amountMinor"}]×5,"recent":Occurrence[]×5}`. `series` cubre los 5 meses anteriores y el actual. `categories` trae los 5 mayores gastos del mes por categoría, con «Sin categoría» para los que no tienen. |
 | `GET /projection` | **`startMonth`**, **`currency`**, `months` (de 1 a 24; 12 por defecto) | `{"currency","months":MonthTotals[]}` |
 | `GET /movements` | **`month`**, **`currency`**, `q` (hasta 90 caracteres; sin distinguir mayúsculas ni acentos, cultura es-AR), `type` (`all`, `income`, `expense`, `card` o `loan`), `page`, `pageSize` (hasta 100) | `{"items":Occurrence[],"page","pageSize","total"}` |
-| `GET /trash` | — | Hasta 100 de cada tipo, por `deletedAt` descendente: `[{"type":"entry"\|"card"\|"loan"\|"transfer","id","concept","currency","amountMinor","date","deletedAt"}]`. Las cuentas y categorías archivadas se ven con `includeDeleted=true`. |
+| `GET /trash` | — | Hasta 100 de cada tipo, por `deletedAt` descendente: `[{"type":"entry"\|"card"\|"loan"\|"transfer","id","concept","currency","amountMinor","date","deletedAt","version"}]`. `version` es la que exige `POST …/{id}/restore?version=`. Las cuentas y categorías archivadas se ven con `includeDeleted=true`. |
 
 Un `month`, `currency`, `type` o `months` inválido devuelve **400**.
 
@@ -666,8 +696,10 @@ No se guarda copia en el servidor, y la exportación queda auditada como `export
 - **404:** el lote no existe o es ajeno.
 - **409** con alguno de estos títulos:
   - «La vista previa caducó. Volvé a subir el archivo.»;
-  - en el formato de exportación, cualquier registro existente con contenido distinto, o una referencia que no está en el archivo: se rechaza todo;
-  - «Otra importación se guardó al mismo tiempo. Generá una vista previa nueva.».
+  - en el formato de exportación, cualquier registro existente con contenido distinto: se rechaza todo;
+  - en el formato de exportación, un pago nuevo del archivo que apunta a un plan o gasto que ya existía y ahora está en la papelera: se rechaza todo («…Restauralo y volvé a intentar.»);
+  - «Otra importación se guardó al mismo tiempo. Generá una vista previa nueva.»: choque con otra escritura simultánea al leer, al guardar o en el `COMMIT` de la transacción `Serializable` (nunca 500). No se escribió nada y la vista previa sigue vigente: se puede reintentar.
+- **422:** el archivo o sus datos normalizados no cumplen las reglas (se revalidan al confirmar), por ejemplo una referencia que no está en el archivo. No se escribe nada.
 - `legacy-v1` importa lo nuevo y deja visibles los duplicados y conflictos, sin sobrescribir nada.
 - Esta ruta no tiene límite de frecuencia propio: depende de una vista previa, que sí lo tiene.
 

@@ -202,7 +202,7 @@ public class FinanceTests(PostgresFixture pg)
         var inst = p.GetProperty("installments").EnumerateArray().ToList();
         Assert.All(inst.Take(9), i => Assert.Equal("declared_paid", i.Str("status")));
         Assert.All(inst.Skip(9), i => Assert.Equal("pending", i.Str("status")));
-        Assert.Equal(0, (await a.GetJson("/api/v1/payments")).GetArrayLength());
+        Assert.Equal(0, (await a.GetJson("/api/v1/payments")).GetProperty("total").GetInt32());
         // El capital recibido no es ingreso presupuestario.
         var d = await a.GetJson("/api/v1/dashboard?month=2025-12&currency=ARS");
         Assert.Equal("0", d.GetProperty("totals").Str("incomeMinor"));

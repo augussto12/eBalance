@@ -75,7 +75,8 @@ public static class CashEndpoints
 
     /// <summary>
     /// Pago con lo que canceló: cada asignación dice a qué cuota (plan, número, vencimiento) o gasto de tarjeta fue.
-    /// Un pago revertido conserva su fila (reversedAt) para el historial.
+    /// Un pago revertido conserva su fila (reversedAt) y sus asignaciones para el historial. Si después se acortó el plan
+    /// y la cuota dejó de existir, la asignación conserva plan y número (installmentId, vencimiento y «de N» en null).
     /// </summary>
     private static object PaymentDto(Payment p) => new
     {
@@ -87,18 +88,23 @@ public static class CashEndpoints
         amountMinor = Money.ToApi(p.AmountMinor),
         note = p.Note,
         allocations = p.Allocations
-            .OrderBy(a => a.Installment?.DueDate ?? a.Entry?.EffectiveDate ?? DateOnly.MinValue).ThenBy(a => a.Installment?.Number ?? 0)
-            .Select(a => new
+            .OrderBy(a => a.Installment?.DueDate ?? a.Entry?.EffectiveDate ?? DateOnly.MaxValue)
+            .ThenBy(a => a.Installment?.Number ?? a.InstallmentNumber ?? 0)
+            .Select(a =>
             {
-                installmentId = a.InstallmentId,
-                entryId = a.EntryId,
-                amountMinor = Money.ToApi(a.AmountMinor),
-                planId = a.Installment?.PlanId,
-                planKind = a.Installment?.Plan?.Kind.Api(),
-                concept = a.Installment?.Plan?.Concept ?? a.Entry?.Concept,
-                installmentNumber = a.Installment?.Number,
-                installmentCount = a.Installment?.Plan?.Count,
-                dueDate = a.Installment?.DueDate.Api() ?? a.Entry?.EffectiveDate.Api(),
+                var plan = a.Installment?.Plan ?? a.Plan;
+                return new
+                {
+                    installmentId = a.InstallmentId,
+                    entryId = a.EntryId,
+                    amountMinor = Money.ToApi(a.AmountMinor),
+                    planId = a.Installment?.PlanId ?? a.PlanId,
+                    planKind = plan?.Kind.Api(),
+                    concept = plan?.Concept ?? a.Entry?.Concept,
+                    installmentNumber = a.Installment?.Number ?? a.InstallmentNumber,
+                    installmentCount = a.Installment?.Plan?.Count,
+                    dueDate = a.Installment?.DueDate.Api() ?? a.Entry?.EffectiveDate.Api(),
+                };
             }),
         version = p.Version,
         createdAt = p.CreatedAt,
@@ -109,14 +115,21 @@ public static class CashEndpoints
     private static IQueryable<Payment> WithDetails(IQueryable<Payment> q) =>
         q.Include(p => p.SourceAccount)
             .Include(p => p.Allocations).ThenInclude(a => a.Installment).ThenInclude(i => i!.Plan)
+            .Include(p => p.Allocations).ThenInclude(a => a.Plan)
             .Include(p => p.Allocations).ThenInclude(a => a.Entry);
 
+    public const int PaymentsMaxPageSize = 200;
+
     /// <summary>
-    /// Historial de pagos del propietario. Filtros: cuenta de origen, plan, cuota, gasto de tarjeta, tarjeta destino,
-    /// tipo (card: cuotas de tarjeta y consumos; loan: cuotas de préstamos), moneda y fechas. Por defecto solo vigentes.
+    /// Historial de pagos del propietario, paginado como /entries: {items, page, pageSize, total}, por fecha, alta e id
+    /// descendentes. Filtros: cuenta de origen, plan, cuota, gasto de tarjeta, tarjeta destino, tipo (card: cuotas de
+    /// tarjeta y consumos; loan: cuotas de préstamos), moneda y fechas. Por defecto solo vigentes.
+    /// El plan de una asignación sale de su cuota o, si la cuota ya no existe (pago revertido y plan acortado), de la
+    /// copia guardada en la asignación: así el pago revertido sigue apareciendo en el historial de su plan y su tarjeta.
     /// </summary>
     private static async Task<IResult> ListPayments(HttpContext ctx, AppDbContext db, string? from, string? to, Guid? accountId,
-        Guid? planId, Guid? installmentId, Guid? entryId, Guid? targetAccountId, string? kind, string? currency, bool? includeReversed, CancellationToken ct)
+        Guid? planId, Guid? installmentId, Guid? entryId, Guid? targetAccountId, string? kind, string? currency, bool? includeReversed,
+        int? page, int? pageSize, CancellationToken ct)
     {
         var v = new Validation();
         var owner = ctx.User.UserId();
@@ -126,22 +139,34 @@ public static class CashEndpoints
         if (to is not null) { var t = v.Date("to", to); q = q.Where(p => p.Date <= t); }
         if (currency is not null) { var c = v.Currency("currency", currency); q = q.Where(p => p.Currency == c); }
         if (accountId is not null) q = q.Where(p => p.SourceAccountId == accountId);
-        if (planId is not null) q = q.Where(p => p.Allocations.Any(a => a.Installment != null && a.Installment.PlanId == planId));
+        if (planId is not null)
+            q = q.Where(p => p.Allocations.Any(a => a.PlanId == planId || (a.Installment != null && a.Installment.PlanId == planId)));
         if (installmentId is not null) q = q.Where(p => p.Allocations.Any(a => a.InstallmentId == installmentId));
         if (entryId is not null) q = q.Where(p => p.Allocations.Any(a => a.EntryId == entryId));
         if (targetAccountId is not null)
             q = q.Where(p => p.Allocations.Any(a => (a.Installment != null && a.Installment.Plan!.AccountId == targetAccountId)
+                                                    || (a.Plan != null && a.Plan.AccountId == targetAccountId)
                                                     || (a.Entry != null && a.Entry.AccountId == targetAccountId)));
         if (kind is not null)
         {
             var k = v.Enum("kind", kind, ApiMaps.PlanKinds, "Tipo de plan no válido.");
             q = k == PlanKind.Card
-                ? q.Where(p => p.Allocations.Any(a => a.EntryId != null || (a.Installment != null && a.Installment.Plan!.Kind == PlanKind.Card)))
-                : q.Where(p => p.Allocations.Any(a => a.Installment != null && a.Installment.Plan!.Kind == PlanKind.Loan));
+                ? q.Where(p => p.Allocations.Any(a => a.EntryId != null
+                                                      || (a.Installment != null && a.Installment.Plan!.Kind == PlanKind.Card)
+                                                      || (a.Plan != null && a.Plan.Kind == PlanKind.Card)))
+                : q.Where(p => p.Allocations.Any(a => (a.Installment != null && a.Installment.Plan!.Kind == PlanKind.Loan)
+                                                      || (a.Plan != null && a.Plan.Kind == PlanKind.Loan)));
         }
         if (!v.IsValid) return v.Problem();
-        var list = await WithDetails(q).AsSplitQuery().OrderByDescending(p => p.Date).ThenByDescending(p => p.CreatedAt).Take(200).ToListAsync(ct);
-        return TypedResults.Ok(list.Select(PaymentDto));
+        // Igual que /entries: fuera de rango se ajusta, no da error.
+        var number = Math.Max(1, page ?? 1);
+        var size = Math.Clamp(pageSize ?? 50, 1, PaymentsMaxPageSize);
+        var skip = (int)Math.Min((long)(number - 1) * size, int.MaxValue);
+        var total = await q.CountAsync(ct);
+        var list = await WithDetails(q).AsSplitQuery()
+            .OrderByDescending(p => p.Date).ThenByDescending(p => p.CreatedAt).ThenByDescending(p => p.Id)
+            .Skip(skip).Take(size).ToListAsync(ct);
+        return TypedResults.Ok(new PageResult<object>(list.Select(PaymentDto).ToList(), number, size, total));
     }
 
     /// <summary>
@@ -176,8 +201,7 @@ public static class CashEndpoints
                 : Problems.Unprocessable("Esa clave de idempotencia ya se usó con otros datos.");
         }
 
-        var strategy = db.Database.CreateExecutionStrategy();
-        return await strategy.ExecuteAsync<IResult>(async () =>
+        return await SerializableAsync(db, async () =>
         {
             await using var tx = await db.Database.BeginTransactionAsync(IsolationLevel.Serializable, ct);
             var source = await Refs.AccountAsync(db, owner, req.SourceAccountId, v, ct, "sourceAccountId");
@@ -241,7 +265,14 @@ public static class CashEndpoints
                     if (inst.Plan!.Currency != currency) { v.Add("allocations", "Alguna cuota es de otra moneda."); return v.Problem(); }
                     if (amt > inst.PendingMinor) return Problems.Unprocessable("Una asignación supera lo pendiente de la cuota.");
                     inst.PaidMinor = checked(inst.PaidMinor + amt);
-                    payment.Allocations.Add(new PaymentAllocation { OwnerId = owner, PaymentId = payment.Id, InstallmentId = id, Installment = inst, AmountMinor = amt });
+                    // El pago también escribe la fila del plan (versión + 1): un borrado o una edición del plan que corre al
+                    // mismo tiempo (con la versión anterior) falla con 409 en vez de dejar un plan eliminado con pagos vigentes.
+                    TouchPlan(db, inst.Plan!);
+                    payment.Allocations.Add(new PaymentAllocation
+                    {
+                        OwnerId = owner, PaymentId = payment.Id, InstallmentId = id, Installment = inst,
+                        PlanId = inst.PlanId, InstallmentNumber = inst.Number, AmountMinor = amt,
+                    });
                 }
                 else
                 {
@@ -266,29 +297,45 @@ public static class CashEndpoints
                 await db.SaveChangesAsync(ct);
                 await tx.CommitAsync(ct);
             }
-            catch (Exception ex) when (IsRetryableConflict(ex))
+            catch (Exception ex) when (Db.IsRetryableConflict(ex))
             {
-                await tx.RollbackAsync(ct);
+                await Db.RollbackQuietlyAsync(tx);
                 db.ChangeTracker.Clear();
-                return Problems.Conflict("Otro cambio se guardó al mismo tiempo. Revisá lo pendiente y volvé a intentar con el mismo pago.");
+                return Problems.Conflict(PaymentConflictMessage);
             }
             payment.SourceAccount = source;
             return TypedResults.Created($"/api/v1/payments/{payment.Id}", PaymentDto(payment));
-        });
+        }, () => Problems.Conflict(PaymentConflictMessage));
     }
 
-    private static bool IsRetryableConflict(Exception ex) =>
-        ex is DbUpdateConcurrencyException
-        || ex is DbUpdateException { InnerException: Npgsql.PostgresException { SqlState: Npgsql.PostgresErrorCodes.SerializationFailure or Npgsql.PostgresErrorCodes.UniqueViolation } }
-        || ex is Npgsql.PostgresException { SqlState: Npgsql.PostgresErrorCodes.SerializationFailure }
-        || ex is InvalidOperationException { InnerException: Npgsql.PostgresException { SqlState: Npgsql.PostgresErrorCodes.SerializationFailure } };
+    private const string PaymentConflictMessage = "Otro cambio se guardó al mismo tiempo. Revisá lo pendiente y volvé a intentar con el mismo pago.";
+
+    /// <summary>
+    /// Transacción Serializable de un pago o una reversión. Los choques al guardar o en el COMMIT se resuelven adentro;
+    /// un 40001 en una lectura (antes de guardar) llega como PostgresException y sale de la transacción (que se deshace al
+    /// liberarse): se responde el mismo 409, nunca 500.
+    /// </summary>
+    private static async Task<IResult> SerializableAsync(AppDbContext db, Func<Task<IResult>> body, Func<IResult> onConflict)
+    {
+        try
+        {
+            return await db.Database.CreateExecutionStrategy().ExecuteAsync(body);
+        }
+        catch (Exception ex) when (Db.IsRetryableConflict(ex))
+        {
+            db.ChangeTracker.Clear();
+            return onConflict();
+        }
+    }
+
+    /// <summary>Marca la versión del plan como modificada: SaveChangesAsync la incrementa y la usa como token de concurrencia.</summary>
+    internal static void TouchPlan(AppDbContext db, InstallmentPlan plan) => db.Entry(plan).Property(p => p.Version).IsModified = true;
 
     /// <summary>Reversión explícita de un pago: devuelve el pendiente a las obligaciones y conserva el registro auditado.</summary>
     private static async Task<IResult> ReversePayment(Guid id, long? version, HttpContext ctx, AppDbContext db, AuditLog audit, TimeProvider clock, CancellationToken ct)
     {
         var owner = ctx.User.UserId();
-        var strategy = db.Database.CreateExecutionStrategy();
-        return await strategy.ExecuteAsync<IResult>(async () =>
+        return await SerializableAsync(db, async () =>
         {
             await using var tx = await db.Database.BeginTransactionAsync(IsolationLevel.Serializable, ct);
             var payment = await WithDetails(db.Payments)
@@ -297,7 +344,11 @@ public static class CashEndpoints
             if (version is null || payment.Version != version) return Problems.VersionConflict(PaymentDto(payment));
             foreach (var a in payment.Allocations)
             {
-                if (a.Installment is { } inst) inst.PaidMinor -= a.AmountMinor;
+                if (a.Installment is { } inst)
+                {
+                    inst.PaidMinor -= a.AmountMinor;
+                    TouchPlan(db, inst.Plan!); // misma regla que al pagar: choca con una edición o un borrado simultáneo del plan
+                }
                 else if (a.Entry is { } entry) entry.PaidMinor -= a.AmountMinor;
             }
             payment.DeletedAt = clock.GetUtcNow();
@@ -307,14 +358,14 @@ public static class CashEndpoints
                 await db.SaveChangesAsync(ct);
                 await tx.CommitAsync(ct);
             }
-            catch (Exception ex) when (IsRetryableConflict(ex))
+            catch (Exception ex) when (Db.IsRetryableConflict(ex))
             {
-                await tx.RollbackAsync(ct);
+                await Db.RollbackQuietlyAsync(tx);
                 db.ChangeTracker.Clear();
                 return Problems.VersionConflict();
             }
             return TypedResults.Ok(PaymentDto(payment));
-        });
+        }, () => Problems.VersionConflict());
     }
 
     private static object TransferDto(Transfer t) => new

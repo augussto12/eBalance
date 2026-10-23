@@ -72,13 +72,19 @@ public sealed class ReportService(AppDbContext db)
     }
 }
 
-/// <summary>Saldo de caja calculado al día <paramref name="AsOf"/> (hoy del propietario) o pendiente total de una tarjeta.</summary>
+/// <summary>
+/// Saldo de caja calculado al día <paramref name="AsOf"/> (hoy del propietario) o pendiente total de una tarjeta. Ambos
+/// con la misma regla: un pago con fecha futura todavía no salió de caja ni redujo lo pendiente de la tarjeta.
+/// </summary>
 public sealed record AccountBalance(long? CashBalanceMinor, long? PendingObligationsMinor, DateOnly? AsOf = null);
 
 /// <summary>
 /// Saldo de caja = apertura + flujos registrados desde la fecha de apertura y HASTA HOY en el calendario del
 /// propietario: un gasto, pago, transferencia o acreditación con fecha futura todavía no movió caja. Sin apertura no
 /// se informa saldo: no se muestra un «disponible» supuesto con datos incompletos.
+/// Pendiente de una tarjeta = cuotas de sus planes + gastos cargados a ella − lo pagado HASTA HOY: lo que un pago con
+/// fecha futura asignó vuelve a sumarse hasta su fecha, igual que su importe sigue en la caja de origen. Así ese dinero
+/// nunca desaparece de los dos lados a la vez. (Lo que falta pagar, /obligations, sí descuenta el pago ya registrado.)
 /// </summary>
 public sealed class BalanceService(AppDbContext db, TimeProvider clock)
 {
@@ -111,6 +117,21 @@ public sealed class BalanceService(AppDbContext db, TimeProvider clock)
             .Where(i => i.OwnerId == owner && i.Plan!.DeletedAt == null && i.Plan.AccountId != null && ids.Contains(i.Plan.AccountId.Value) && !i.DeclaredPaid)
             .Select(i => new { AccountId = i.Plan!.AccountId!.Value, Pending = i.AmountMinor - i.PaidMinor, i.Plan.Currency })
             .ToListAsync(ct);
+        // Asignaciones de pagos vigentes con fecha posterior a hoy, a cuotas o gastos que hoy cuentan en el pendiente.
+        var futurePaid = await db.PaymentAllocations.AsNoTracking()
+            .Where(x => x.OwnerId == owner && x.Payment!.DeletedAt == null && x.Payment.Date > today
+                        && ((x.Installment != null && x.Installment.Plan!.DeletedAt == null && !x.Installment.DeclaredPaid
+                             && x.Installment.Plan.AccountId != null && ids.Contains(x.Installment.Plan.AccountId.Value))
+                            || (x.Entry != null && x.Entry.DeletedAt == null && x.Entry.Kind == EntryKind.Expense
+                                && x.Entry.AccountId != null && ids.Contains(x.Entry.AccountId.Value))))
+            .Select(x => new
+            {
+                AccountId = x.Installment != null ? x.Installment.Plan!.AccountId!.Value : x.Entry!.AccountId!.Value,
+                Currency = x.Installment != null ? x.Installment.Plan!.Currency : x.Entry!.Currency,
+                PaymentCurrency = x.Payment!.Currency,
+                x.AmountMinor,
+            })
+            .ToListAsync(ct);
 
         // Defensa: nunca se suman importes de otra moneda que la de la cuenta, aunque un dato incoherente lo referencie.
         foreach (var a in accounts)
@@ -118,7 +139,8 @@ public sealed class BalanceService(AppDbContext db, TimeProvider clock)
             if (a.Kind == AccountKind.CreditCard)
             {
                 var pending = checked(Money.Sum(cardInstallments.Where(x => x.AccountId == a.Id && x.Currency == a.Currency).Select(x => x.Pending))
-                              + Money.Sum(entries.Where(x => x.AccountId == a.Id && x.Currency == a.Currency && x.Kind == EntryKind.Expense).Select(x => x.AmountMinor - x.PaidMinor)));
+                              + Money.Sum(entries.Where(x => x.AccountId == a.Id && x.Currency == a.Currency && x.Kind == EntryKind.Expense).Select(x => x.AmountMinor - x.PaidMinor))
+                              + Money.Sum(futurePaid.Where(x => x.AccountId == a.Id && x.Currency == a.Currency && x.PaymentCurrency == a.Currency).Select(x => x.AmountMinor)));
                 result[a.Id] = new AccountBalance(null, pending);
                 continue;
             }

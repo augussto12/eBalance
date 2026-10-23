@@ -285,9 +285,10 @@ public static class PlanEndpoints
 
     /// <summary>
     /// Recalcula el cronograma de un plan SIN pagos vigentes. Las cuotas que siguen existiendo (mismo número) se
-    /// actualizan en su fila; las que sobran se eliminan. Un pago revertido conserva su fila, su auditoría y sus
-    /// asignaciones a las cuotas que siguen existiendo; solo se quitan sus asignaciones a cuotas que dejan de existir,
-    /// porque ya no tienen a qué apuntar (antes, la FK de esas asignaciones hacía fallar la edición con 500).
+    /// actualizan en su fila; las que sobran se eliminan. Un pago revertido conserva su fila, su auditoría y TODAS sus
+    /// asignaciones: las que apuntaban a una cuota que deja de existir dejan de apuntarle (antes, su FK hacía fallar la
+    /// edición con 500) pero conservan el plan y el número de cuota, así el pago sigue en el historial del plan y de la
+    /// tarjeta y su importe sigue siendo la suma de sus asignaciones.
     /// </summary>
     private static async Task<bool> RebuildScheduleAsync(AppDbContext db, InstallmentPlan plan, CancellationToken ct)
     {
@@ -315,9 +316,17 @@ public static class PlanEndpoints
             .Where(a => a.OwnerId == plan.OwnerId && a.InstallmentId != null && removedIds.Contains(a.InstallmentId.Value))
             .Include(a => a.Payment)
             .ToListAsync(ct);
-        // Defensa: una asignación de un pago vigente nunca se borra (no debería existir con PaidMinor en cero).
+        // Defensa: una asignación de un pago vigente nunca se desvincula (no debería existir con PaidMinor en cero).
         if (stale.Any(a => a.Payment!.DeletedAt is null)) return false;
-        db.PaymentAllocations.RemoveRange(stale);
+        var numbers = removed.ToDictionary(i => i.Id, i => i.Number);
+        foreach (var a in stale)
+        {
+            a.PlanId = plan.Id;
+            a.InstallmentNumber = numbers[a.InstallmentId!.Value];
+            a.InstallmentId = null;
+            a.Installment = null;
+        }
+        db.ChangeTracker.DetectChanges();
         db.Installments.RemoveRange(removed);
         foreach (var r in removed) plan.Installments.Remove(r);
         return true;

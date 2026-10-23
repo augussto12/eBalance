@@ -162,10 +162,19 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options, TimePro
                 .HasPrincipalKey(p => new { p.OwnerId, p.Id })
                 .OnDelete(DeleteBehavior.Restrict);
             OwnedRef(e.HasOne(x => x.Entry).WithMany(), x => new { x.OwnerId, x.EntryId });
+            // Los planes solo se eliminan de forma reversible: la copia del plan siempre resuelve.
+            OwnedRef(e.HasOne(x => x.Plan).WithMany(), x => new { x.OwnerId, x.PlanId });
             e.ToTable(t =>
             {
                 t.HasCheckConstraint("ck_allocations_amount", "amount_minor > 0");
-                t.HasCheckConstraint("ck_allocations_target", "(installment_id IS NULL) <> (entry_id IS NULL)");
+                t.HasCheckConstraint("ck_allocations_installment_number", "installment_number IS NULL OR installment_number >= 1");
+                // Una cuota o un gasto, nunca ambos; un gasto no lleva copia de plan; sin cuota ni gasto (pago revertido cuya
+                // cuota dejó de existir) queda la copia de plan y número. Una cuota sin copia sigue siendo válida: así inserta
+                // la versión anterior (rollback sin revertir migraciones).
+                t.HasCheckConstraint("ck_allocations_target",
+                    "NOT (installment_id IS NOT NULL AND entry_id IS NOT NULL)"
+                    + " AND (entry_id IS NULL OR (plan_id IS NULL AND installment_number IS NULL))"
+                    + " AND (installment_id IS NOT NULL OR entry_id IS NOT NULL OR (plan_id IS NOT NULL AND installment_number IS NOT NULL))");
             });
         });
 

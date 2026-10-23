@@ -25,6 +25,19 @@ public class PaymentsAndPlansTests(PostgresFixture pg)
 
     private static List<JsonElement> Installments(JsonElement plan) => plan.GetProperty("installments").EnumerateArray().ToList();
 
+    /// <summary>GET /payments devuelve una página como /entries: {items, page, pageSize, total}.</summary>
+    private static async Task<List<JsonElement>> PaymentsAsync(Client c, string query = "")
+    {
+        var page = await c.GetJson("/api/v1/payments" + query);
+        var items = page.GetProperty("items").EnumerateArray().ToList();
+        Assert.True(page.GetProperty("total").GetInt32() >= items.Count);
+        return items;
+    }
+
+    private static async Task<List<string>> PaymentIdsAsync(Client c, string query = "") => (await PaymentsAsync(c, query)).Select(p => p.Str("id")).ToList();
+
+    private static async Task<long> PlanVersionAsync(Client c, string planId) => (await c.GetJson($"/api/v1/plans/{planId}")).GetProperty("version").GetInt64();
+
     private static async Task<JsonElement> PayInstallmentAsync(Client a, Guid source, string installmentId, string amount, string date, string key) =>
         await a.PostJson("/api/v1/payments", new
         {
@@ -95,8 +108,8 @@ public class PaymentsAndPlansTests(PostgresFixture pg)
             },
         }, HttpStatusCode.Created, Key("pago-revertido-0001"));
 
-        // Con pago vigente: bloqueado, con código para que la UI ofrezca la lista de pagos.
-        var blocked = await a.PatchAsync($"/api/v1/plans/{id}", PlanBody(visa, "20000", 2, "2027-01-10", version: 1));
+        // Con pago vigente: bloqueado, con código para que la UI ofrezca la lista de pagos. (El pago subió la versión del plan.)
+        var blocked = await a.PatchAsync($"/api/v1/plans/{id}", PlanBody(visa, "20000", 2, "2027-01-10", version: await PlanVersionAsync(a, id)));
         Assert.Equal(HttpStatusCode.Conflict, blocked.StatusCode);
         Assert.Equal("payments_applied", (await blocked.Json()).Str("code"));
 
@@ -117,20 +130,277 @@ public class PaymentsAndPlansTests(PostgresFixture pg)
         var grow = await a.PatchAsync($"/api/v1/plans/{id}", PlanBody(visa, "40000", 4, "2027-02-10", version: edited.GetProperty("version").GetInt64()));
         Assert.Equal(HttpStatusCode.OK, grow.StatusCode);
 
-        // El pago revertido sigue en el historial (fila y auditoría), sin su asignación a la cuota que dejó de existir.
-        Assert.Equal(0, (await a.GetJson($"/api/v1/payments?planId={id}")).GetArrayLength());
-        var history = await a.GetJson($"/api/v1/payments?planId={id}&includeReversed=true");
-        var reversed = Assert.Single(history.EnumerateArray());
+        // El pago revertido sigue en el historial (fila, auditoría y TODAS sus asignaciones): la de la cuota que dejó de
+        // existir ya no apunta a una cuota, pero conserva plan y número, y el importe sigue siendo la suma de asignaciones.
+        Assert.Empty(await PaymentsAsync(a, $"?planId={id}"));
+        var reversed = Assert.Single(await PaymentsAsync(a, $"?planId={id}&includeReversed=true"));
         Assert.Equal(payment.Str("id"), reversed.Str("id"));
         Assert.NotEqual(JsonValueKind.Null, reversed.GetProperty("reversedAt").ValueKind);
-        var allocation = Assert.Single(reversed.GetProperty("allocations").EnumerateArray());
-        Assert.Equal(1, allocation.GetProperty("installmentNumber").GetInt32());
+        var allocations = reversed.GetProperty("allocations").EnumerateArray().ToList();
+        Assert.Equal([1, 3], allocations.Select(x => x.GetProperty("installmentNumber").GetInt32()));
+        Assert.Equal(inst[0].Str("id"), allocations[0].Str("installmentId"));
+        Assert.Equal(JsonValueKind.Null, allocations[1].GetProperty("installmentId").ValueKind);
+        Assert.Equal(id, allocations[1].Str("planId"));
+        Assert.Equal("Heladera", allocations[1].Str("concept"));
+        Assert.Equal(JsonValueKind.Null, allocations[1].GetProperty("installmentCount").ValueKind);
+        Assert.Equal(JsonValueKind.Null, allocations[1].GetProperty("dueDate").ValueKind);
+        Assert.Equal(20000, allocations.Sum(x => long.Parse(x.Str("amountMinor"), System.Globalization.CultureInfo.InvariantCulture)));
         // Fuera de un request no hay propietario: la verificación directa en la base usa el bypass explícito del filtro.
         await using var db = app.NewDbContext();
         var paymentId = payment.Str("id");
         Assert.Equal(1, await db.AuditEvents.IgnoreQueryFilters([AppDbContext.OwnerFilter]).CountAsync(e => e.Action == "payment.create" && e.ResourceId == paymentId));
         Assert.Equal(1, await db.AuditEvents.IgnoreQueryFilters([AppDbContext.OwnerFilter]).CountAsync(e => e.Action == "payment.reverse" && e.ResourceId == paymentId));
         Assert.True(await db.Payments.IgnoreQueryFilters([AppDbContext.OwnerFilter]).AnyAsync(p => p.Id == Guid.Parse(paymentId) && p.DeletedAt != null));
+    }
+
+    /// <summary>
+    /// Un pago revertido que solo pagaba la cuota 3, y el plan se acorta a 2 cuotas: antes la asignación se borraba y el
+    /// pago quedaba con importe pero sin asignaciones, invisible en todo historial filtrado de la UI.
+    /// </summary>
+    [Fact]
+    public async Task Reversed_payment_whose_only_installment_disappears_stays_in_the_plan_and_card_history()
+    {
+        await using var app = await TestApp.StartAsync(pg);
+        var a = await app.SignedInAsync();
+        var bank = await a.AccountAsync("Banco");
+        var visa = await a.AccountAsync("Visa", "credit_card");
+        var plan = await a.PostJson("/api/v1/plans", PlanBody(visa, "30000", 3, "2027-01-10"));
+        var id = plan.Str("id");
+        var payment = await PayInstallmentAsync(a, bank, Installments(plan)[2].Str("id"), "10000", "2027-01-05", "pago-solo-cuota-3");
+        Assert.Equal(HttpStatusCode.OK, (await a.DeleteAsync($"/api/v1/payments/{payment.Str("id")}?version=1")).StatusCode);
+        var edit = await a.PatchAsync($"/api/v1/plans/{id}", PlanBody(visa, "20000", 2, "2027-01-10", version: await PlanVersionAsync(a, id)));
+        Assert.True(edit.StatusCode == HttpStatusCode.OK, await edit.Content.ReadAsStringAsync());
+        Assert.Equal(2, Installments(await edit.Json()).Count);
+
+        foreach (var query in new[] { $"?planId={id}&includeReversed=true", "?kind=card&currency=ARS&includeReversed=true", $"?targetAccountId={visa}&includeReversed=true", "?includeReversed=true" })
+        {
+            var reversed = Assert.Single(await PaymentsAsync(a, query));
+            Assert.Equal(payment.Str("id"), reversed.Str("id"));
+            Assert.Equal("10000", reversed.Str("amountMinor"));
+            var allocation = Assert.Single(reversed.GetProperty("allocations").EnumerateArray());
+            Assert.Equal("10000", allocation.Str("amountMinor"));
+            Assert.Equal(3, allocation.GetProperty("installmentNumber").GetInt32());
+            Assert.Equal(id, allocation.Str("planId"));
+            Assert.Equal("card", allocation.Str("planKind"));
+            Assert.Equal("Heladera", allocation.Str("concept"));
+            Assert.Equal(JsonValueKind.Null, allocation.GetProperty("installmentId").ValueKind);
+        }
+        Assert.Empty(await PaymentsAsync(a, "?kind=loan&includeReversed=true"));
+        Assert.Empty(await PaymentsAsync(a, $"?planId={id}"));
+
+        // Si el plan vuelve a crecer, la cuota 3 nueva es otra: el pago revertido no se le atribuye.
+        var grow = await a.PatchAsync($"/api/v1/plans/{id}", PlanBody(visa, "40000", 4, "2027-01-10", version: await PlanVersionAsync(a, id)));
+        Assert.Equal(HttpStatusCode.OK, grow.StatusCode);
+        var third = Installments(await grow.Json())[2];
+        Assert.Equal("pending", third.Str("status"));
+        Assert.Empty(await PaymentsAsync(a, $"?installmentId={third.Str("id")}&includeReversed=true"));
+        Assert.Single(await PaymentsAsync(a, $"?planId={id}&includeReversed=true"));
+
+        await using var db = app.NewDbContext();
+        var row = await db.PaymentAllocations.IgnoreQueryFilters([AppDbContext.OwnerFilter]).SingleAsync(x => x.PaymentId == Guid.Parse(payment.Str("id")));
+        Assert.Null(row.InstallmentId);
+        Assert.Equal(Guid.Parse(id), row.PlanId);
+        Assert.Equal(3, row.InstallmentNumber);
+    }
+
+    /// <summary>
+    /// La migración copia plan y número de las asignaciones existentes, y una asignación sin copia (como las que inserta
+    /// la versión anterior tras un rollback sin revertir migraciones) se sigue encontrando por su cuota.
+    /// </summary>
+    [Fact]
+    public async Task Allocation_plan_snapshot_is_backfilled_and_rows_without_it_still_work()
+    {
+        await using var app = await TestApp.StartAsync(pg);
+        var a = await app.SignedInAsync();
+        var bank = await a.AccountAsync("Banco");
+        var visa = await a.AccountAsync("Visa", "credit_card");
+        var plan = await a.PostJson("/api/v1/plans", PlanBody(visa, "30000", 3, "2027-01-10"));
+        var id = plan.Str("id");
+        var live = await PayInstallmentAsync(a, bank, Installments(plan)[2].Str("id"), "10000", "2027-01-05", "pago-vigente-backfill");
+
+        // Volver a la migración anterior y aplicarla de nuevo: las asignaciones existentes se completan desde su cuota.
+        await using (var migrator = new AppDbContext(TestApp.DbOptions(app.ConnectionString), TimeProvider.System))
+        {
+            var m = Microsoft.EntityFrameworkCore.Infrastructure.AccessorExtensions.GetService<Microsoft.EntityFrameworkCore.Migrations.IMigrator>(migrator);
+            await m.MigrateAsync("20261023024121_RecordStampsAndKeyRingSentinel");
+            await m.MigrateAsync();
+        }
+        await using (var db = app.NewDbContext())
+        {
+            var row = await db.PaymentAllocations.IgnoreQueryFilters([AppDbContext.OwnerFilter]).SingleAsync();
+            Assert.Equal(Guid.Parse(id), row.PlanId);
+            Assert.Equal(3, row.InstallmentNumber);
+            // Fila como la inserta la versión anterior: con cuota y sin copia.
+            await db.Database.ExecuteSqlRawAsync("UPDATE payment_allocations SET plan_id = NULL, installment_number = NULL");
+        }
+        Assert.Equal([live.Str("id")], await PaymentIdsAsync(a, $"?planId={id}"));
+        Assert.Equal([live.Str("id")], await PaymentIdsAsync(a, "?kind=card"));
+        Assert.Equal([live.Str("id")], await PaymentIdsAsync(a, $"?targetAccountId={visa}"));
+        Assert.Equal(id, (await PaymentsAsync(a))[0].GetProperty("allocations")[0].Str("planId"));
+
+        // Revertir y acortar el plan: la copia se completa en ese momento, desde la cuota que deja de existir.
+        Assert.Equal(HttpStatusCode.OK, (await a.DeleteAsync($"/api/v1/payments/{live.Str("id")}?version=1")).StatusCode);
+        var shrink = await a.PatchAsync($"/api/v1/plans/{id}", PlanBody(visa, "20000", 2, "2027-01-10", version: await PlanVersionAsync(a, id)));
+        Assert.True(shrink.StatusCode == HttpStatusCode.OK, await shrink.Content.ReadAsStringAsync());
+        var reversed = Assert.Single(await PaymentsAsync(a, $"?planId={id}&includeReversed=true"));
+        Assert.Equal(3, reversed.GetProperty("allocations")[0].GetProperty("installmentNumber").GetInt32());
+        await using (var db = app.NewDbContext())
+        {
+            var row = await db.PaymentAllocations.IgnoreQueryFilters([AppDbContext.OwnerFilter]).SingleAsync();
+            Assert.Null(row.InstallmentId);
+            Assert.Equal(Guid.Parse(id), row.PlanId);
+            Assert.Equal(3, row.InstallmentNumber);
+        }
+    }
+
+    [Fact]
+    public async Task Payment_history_is_paged_like_entries_with_a_total_and_a_stable_order()
+    {
+        await using var app = await TestApp.StartAsync(pg);
+        var a = await app.SignedInAsync();
+        var bank = await a.AccountAsync("Banco");
+        var plan = await a.PostJson("/api/v1/plans", PlanBody(null, "100000", 10, "2027-01-10", kind: "loan", concept: "Préstamo"));
+        var id = plan.Str("id");
+        var ids = new List<string>();
+        for (var day = 1; day <= 5; day++)
+        {
+            ids.Add((await a.PostJson("/api/v1/payments", new { sourceAccountId = bank, planId = Guid.Parse(id), date = $"2027-01-0{day}", currency = "ARS", amountMinor = "100" },
+                HttpStatusCode.Created, Key($"pago-pagina-000{day}"))).Str("id"));
+        }
+        ids.Reverse(); // fecha descendente
+
+        var first = await a.GetJson($"/api/v1/payments?planId={id}&pageSize=2");
+        Assert.Equal(1, first.GetProperty("page").GetInt32());
+        Assert.Equal(2, first.GetProperty("pageSize").GetInt32());
+        Assert.Equal(5, first.GetProperty("total").GetInt32());
+        Assert.Equal(ids[..2], first.GetProperty("items").EnumerateArray().Select(p => p.Str("id")));
+        Assert.Equal(ids[2..4], await PaymentIdsAsync(a, $"?planId={id}&pageSize=2&page=2"));
+        Assert.Equal(ids[4..], await PaymentIdsAsync(a, $"?planId={id}&pageSize=2&page=3"));
+        var beyond = await a.GetJson($"/api/v1/payments?planId={id}&pageSize=2&page=4");
+        Assert.Empty(beyond.GetProperty("items").EnumerateArray());
+        Assert.Equal(5, beyond.GetProperty("total").GetInt32());
+        Assert.Empty(await PaymentsAsync(a, $"?planId={id}&page={int.MaxValue}"));
+
+        // Por defecto 50, máximo 200; fuera de rango se ajusta (igual que /entries).
+        Assert.Equal(50, (await a.GetJson("/api/v1/payments")).GetProperty("pageSize").GetInt32());
+        Assert.Equal(200, (await a.GetJson("/api/v1/payments?pageSize=500")).GetProperty("pageSize").GetInt32());
+        var clamped = await a.GetJson("/api/v1/payments?pageSize=0&page=0");
+        Assert.Equal(1, clamped.GetProperty("pageSize").GetInt32());
+        Assert.Equal(1, clamped.GetProperty("page").GetInt32());
+        Assert.Equal(HttpStatusCode.BadRequest, (await a.GetAsync("/api/v1/payments?pageSize=muchos")).StatusCode);
+
+        // Misma fecha y mismo instante de alta: el id desempata, las páginas no se pisan ni se saltean pagos.
+        var sameDay = new List<string>();
+        for (var n = 1; n <= 3; n++)
+        {
+            sameDay.Add((await a.PostJson("/api/v1/payments", new { sourceAccountId = bank, planId = Guid.Parse(id), date = "2027-02-01", currency = "ARS", amountMinor = "100" },
+                HttpStatusCode.Created, Key($"pago-mismo-dia-{n}"))).Str("id"));
+        }
+        var paged = new List<string>();
+        for (var page = 1; page <= 3; page++) paged.AddRange(await PaymentIdsAsync(a, $"?planId={id}&from=2027-02-01&pageSize=1&page={page}"));
+        Assert.Equal(sameDay.Order(StringComparer.Ordinal), paged.Order(StringComparer.Ordinal));
+        Assert.Equal(paged, await PaymentIdsAsync(a, $"?planId={id}&from=2027-02-01"));
+    }
+
+    /// <summary>
+    /// Carrera real: el borrado del plan llega mientras un pago a una de sus cuotas está por confirmarse. Antes el pago no
+    /// tocaba la fila del plan, así que los dos se confirmaban y quedaba un plan eliminado con un pago vigente.
+    /// </summary>
+    [Fact]
+    public async Task Payments_write_the_plan_row_so_a_concurrent_plan_delete_cannot_leave_a_deleted_plan_with_payments()
+    {
+        var hook = new SerializableCommitHook();
+        await using var app = await TestApp.StartAsync(pg, configureServices: hook.Register());
+        var a = await app.SignedInAsync();
+        var bank = await a.AccountAsync("Banco");
+        var visa = await a.AccountAsync("Visa", "credit_card");
+        var plan = await a.PostJson("/api/v1/plans", PlanBody(visa, "30000", 3, "2027-01-10"));
+        var id = plan.Str("id");
+        var inst = Installments(plan);
+
+        // Pagar y revertir cambian el estado del plan: su versión sube, y una edición con la versión anterior da 409.
+        Assert.Equal(1, await PlanVersionAsync(a, id));
+        var first = await PayInstallmentAsync(a, bank, inst[0].Str("id"), "1000", "2027-01-05", "pago-version-plan-1");
+        Assert.Equal(2, await PlanVersionAsync(a, id));
+        var stale = await a.PatchAsync($"/api/v1/plans/{id}", new { kind = "card", concept = "Otro nombre", amountMode = "total", amountMinor = "30000", count = 3, currency = "ARS", firstDueDate = "2027-01-10", accountId = visa, version = 1 });
+        Assert.Equal(HttpStatusCode.Conflict, stale.StatusCode);
+        Assert.Equal(2, (await stale.Json()).GetProperty("current").GetProperty("version").GetInt64());
+        Assert.Equal(HttpStatusCode.OK, (await a.DeleteAsync($"/api/v1/payments/{first.Str("id")}?version=1")).StatusCode);
+        Assert.Equal(3, await PlanVersionAsync(a, id));
+
+        var version = await PlanVersionAsync(a, id);
+        Task<HttpResponseMessage>? delete = null;
+        var waited = false;
+        hook.Arm(async () =>
+        {
+            // El pago ya escribió sus filas y está por confirmar: el borrado (con la versión vigente) llega ahora.
+            delete = a.DeleteAsync($"/api/v1/plans/{id}?version={version}");
+            waited = await PgProbe.WaitForLockWaitAsync(app.ConnectionString, delete, TimeSpan.FromSeconds(10));
+        });
+        await PayInstallmentAsync(a, bank, inst[1].Str("id"), "1000", "2027-01-06", "pago-carrera-plan-1");
+        Assert.NotNull(delete);
+        var deleted = await delete;
+        Assert.True(waited, "el borrado del plan no esperó al pago en curso");
+        Assert.Equal(HttpStatusCode.Conflict, deleted.StatusCode);
+
+        var after = await a.GetJson($"/api/v1/plans/{id}");
+        Assert.Equal(JsonValueKind.Null, after.GetProperty("deletedAt").ValueKind);
+        Assert.True(after.GetProperty("hasPayments").GetBoolean());
+        Assert.Empty((await a.GetJson("/api/v1/trash")).EnumerateArray());
+        // Ahora el borrado ve el pago y lo exige revertir primero.
+        var retry = await a.DeleteAsync($"/api/v1/plans/{id}?version={after.GetProperty("version").GetInt64()}");
+        Assert.Equal("payments_applied", (await retry.Json()).Str("code"));
+    }
+
+    /// <summary>
+    /// Un 40001 en el COMMIT del pago (otra escritura Serializable confirmó primero y lo dejó como «pivot») llega como
+    /// PostgresException y Npgsql ya dio la transacción por terminada: volver a deshacerla lanzaba y el 409 era un 500.
+    /// </summary>
+    [Fact]
+    public async Task Serialization_failure_at_payment_commit_returns_409_and_the_same_key_can_be_retried()
+    {
+        var hook = new SerializableCommitHook();
+        await using var app = await TestApp.StartAsync(pg, configureServices: hook.Register());
+        var a = await app.SignedInAsync();
+        var bank = await a.AccountAsync("Banco");
+        var visa = await a.AccountAsync("Visa", "credit_card");
+        var plan = await a.PostJson("/api/v1/plans", PlanBody(visa, "30000", 3, "2027-01-10"));
+        Guid owner;
+        await using (var db = app.NewDbContext()) owner = (await db.Users.SingleAsync()).Id;
+
+        hook.Arm(async () =>
+        {
+            // Lee lo que el pago escribió (cuotas) y escribe algo que el pago leyó (cuentas), y confirma primero.
+            await using var conn = new Npgsql.NpgsqlConnection(app.ConnectionString);
+            await conn.OpenAsync();
+            await using var tx = await conn.BeginTransactionAsync(System.Data.IsolationLevel.Serializable);
+            await using (var read = new Npgsql.NpgsqlCommand("SELECT sum(paid_minor) FROM installments WHERE owner_id = @o", conn, tx))
+            {
+                read.Parameters.AddWithValue("o", owner);
+                await read.ExecuteScalarAsync();
+            }
+            await using (var write = new Npgsql.NpgsqlCommand(
+                "INSERT INTO accounts (id, owner_id, name, kind, currency, created_at, updated_at, version) VALUES (@id, @o, 'Concurrente', 'Bank', 'ARS', now(), now(), 1)", conn, tx))
+            {
+                write.Parameters.AddWithValue("id", Guid.NewGuid());
+                write.Parameters.AddWithValue("o", owner);
+                await write.ExecuteNonQueryAsync();
+            }
+            await tx.CommitAsync();
+        });
+        var body = new
+        {
+            sourceAccountId = bank, date = "2027-01-05", currency = "ARS", amountMinor = "1000",
+            allocations = new[] { new { installmentId = Guid.Parse(Installments(plan)[0].Str("id")), amountMinor = "1000" } },
+        };
+        var conflict = await a.PostAsync("/api/v1/payments", body, Key("pago-pivot-0001"));
+        Assert.True(conflict.StatusCode == HttpStatusCode.Conflict, $"{(int)conflict.StatusCode} {await conflict.Content.ReadAsStringAsync()}");
+        Assert.Empty(await PaymentsAsync(a, "?includeReversed=true"));
+        Assert.Equal("0", (await a.GetJson($"/api/v1/plans/{plan.Str("id")}")).Str("paidMinor"));
+
+        var retry = await a.PostJson("/api/v1/payments", body, HttpStatusCode.Created, Key("pago-pivot-0001"));
+        Assert.Equal("1000", retry.Str("amountMinor"));
+        Assert.Equal("1000", (await a.GetJson($"/api/v1/plans/{plan.Str("id")}")).Str("paidMinor"));
     }
 
     [Fact]
@@ -261,29 +531,29 @@ public class PaymentsAndPlansTests(PostgresFixture pg)
         Assert.Equal("2027-02-10", created.Str("dueDate"));
         Assert.Equal("Banco", payCard.Str("sourceAccountName"));
 
-        static List<string> Ids(JsonElement list) => list.EnumerateArray().Select(p => p.Str("id")).ToList();
-        Assert.Equal([payCard.Str("id")], Ids(await a.GetJson($"/api/v1/payments?planId={card.Str("id")}")));
-        Assert.Equal([payCard.Str("id")], Ids(await a.GetJson($"/api/v1/payments?installmentId={Installments(card)[1].Str("id")}")));
-        Assert.Empty(Ids(await a.GetJson($"/api/v1/payments?installmentId={Installments(card)[0].Str("id")}")));
-        Assert.Equal([payDinner.Str("id")], Ids(await a.GetJson($"/api/v1/payments?entryId={dinner}")));
-        Assert.Equal("Cena", (await a.GetJson($"/api/v1/payments?entryId={dinner}"))[0].GetProperty("allocations")[0].Str("concept"));
-        Assert.Equal([payDinner.Str("id"), payCard.Str("id")], Ids(await a.GetJson("/api/v1/payments?kind=card&currency=ARS")));
-        Assert.Equal([payDinner.Str("id"), payCard.Str("id")], Ids(await a.GetJson($"/api/v1/payments?targetAccountId={visa}")));
-        Assert.Equal([payLoan.Str("id")], Ids(await a.GetJson("/api/v1/payments?kind=loan")));
-        Assert.Empty(Ids(await a.GetJson("/api/v1/payments?currency=USD")));
+        Assert.Equal([payCard.Str("id")], await PaymentIdsAsync(a, $"?planId={card.Str("id")}"));
+        Assert.Equal([payCard.Str("id")], await PaymentIdsAsync(a, $"?installmentId={Installments(card)[1].Str("id")}"));
+        Assert.Empty(await PaymentIdsAsync(a, $"?installmentId={Installments(card)[0].Str("id")}"));
+        Assert.Equal([payDinner.Str("id")], await PaymentIdsAsync(a, $"?entryId={dinner}"));
+        Assert.Equal("Cena", (await PaymentsAsync(a, $"?entryId={dinner}"))[0].GetProperty("allocations")[0].Str("concept"));
+        Assert.Equal([payDinner.Str("id"), payCard.Str("id")], await PaymentIdsAsync(a, "?kind=card&currency=ARS"));
+        Assert.Equal([payDinner.Str("id"), payCard.Str("id")], await PaymentIdsAsync(a, $"?targetAccountId={visa}"));
+        Assert.Equal([payLoan.Str("id")], await PaymentIdsAsync(a, "?kind=loan"));
+        Assert.Empty(await PaymentIdsAsync(a, "?currency=USD"));
         Assert.Equal(HttpStatusCode.BadRequest, (await a.GetAsync("/api/v1/payments?kind=otro")).StatusCode);
 
         // Revertir con versión vieja → 409; con la actual → 200; queda fuera de la lista por defecto.
         Assert.Equal(HttpStatusCode.Conflict, (await a.DeleteAsync($"/api/v1/payments/{payDinner.Str("id")}?version=9")).StatusCode);
         Assert.Equal(HttpStatusCode.OK, (await a.DeleteAsync($"/api/v1/payments/{payDinner.Str("id")}?version=1")).StatusCode);
         Assert.Equal(HttpStatusCode.NotFound, (await a.DeleteAsync($"/api/v1/payments/{payDinner.Str("id")}?version=2")).StatusCode);
-        Assert.Empty(Ids(await a.GetJson($"/api/v1/payments?entryId={dinner}")));
-        Assert.Equal([payDinner.Str("id")], Ids(await a.GetJson($"/api/v1/payments?entryId={dinner}&includeReversed=true")));
+        Assert.Empty(await PaymentIdsAsync(a, $"?entryId={dinner}"));
+        Assert.Equal([payDinner.Str("id")], await PaymentIdsAsync(a, $"?entryId={dinner}&includeReversed=true"));
         Assert.Equal("0", (await a.GetJson($"/api/v1/entries/{dinner}")).Str("paidMinor"));
 
         var b = await app.SignedInAsync("intruso", "otra frase larga para el intruso");
-        Assert.Empty(Ids(await b.GetJson($"/api/v1/payments?planId={card.Str("id")}&includeReversed=true")));
-        Assert.Empty(Ids(await b.GetJson("/api/v1/payments?includeReversed=true")));
+        Assert.Empty(await PaymentIdsAsync(b, $"?planId={card.Str("id")}&includeReversed=true"));
+        Assert.Empty(await PaymentIdsAsync(b, "?includeReversed=true"));
+        Assert.Equal(0, (await b.GetJson("/api/v1/payments?includeReversed=true")).GetProperty("total").GetInt32());
         Assert.Equal(HttpStatusCode.NotFound, (await b.DeleteAsync($"/api/v1/payments/{payCard.Str("id")}?version=1")).StatusCode);
     }
 
@@ -309,8 +579,7 @@ public class PaymentsAndPlansTests(PostgresFixture pg)
         Assert.Equal("payments_applied", (await entryEdit.Json()).Str("code"));
 
         // El mensaje ya no es un callejón sin salida: la lista de pagos del gasto lleva al pago, que se revierte.
-        var payments = await a.GetJson($"/api/v1/payments?entryId={entry.Str("id")}");
-        var payment = Assert.Single(payments.EnumerateArray());
+        var payment = Assert.Single(await PaymentsAsync(a, $"?entryId={entry.Str("id")}"));
         Assert.Equal(2, payment.GetProperty("allocations").GetArrayLength());
         Assert.Equal(HttpStatusCode.OK, (await a.DeleteAsync($"/api/v1/payments/{payment.Str("id")}?version={payment.GetProperty("version").GetInt64()}")).StatusCode);
         var entryVersion = (await a.GetJson($"/api/v1/entries/{entry.Str("id")}")).GetProperty("version").GetInt64();
@@ -356,7 +625,7 @@ public class PaymentsAndPlansTests(PostgresFixture pg)
             var p = await c.GetJson($"/api/v1/plans/{plan.Str("id")}");
             Assert.Equal("14000", p.Str("paidMinor"));
             Assert.Equal("16000", p.Str("pendingMinor"));
-            Assert.Equal(2, (await c.GetJson($"/api/v1/payments?planId={plan.Str("id")}")).GetArrayLength());
+            Assert.Equal(2, (await PaymentsAsync(c, $"?planId={plan.Str("id")}")).Count);
         }
 
         await AssertMonthsAsync(a);
@@ -403,6 +672,12 @@ public class PaymentsAndPlansTests(PostgresFixture pg)
         Assert.Equal(Iso(today), accounts["Banco"].Str("cashBalanceAsOf"));
         Assert.Equal("0", accounts["Billetera"].Str("cashBalanceMinor"));
         Assert.Equal("99000", (await a.GetJson($"/api/v1/accounts/{bank}")).Str("cashBalanceMinor"));
+        // El pago de la tarjeta con fecha futura todavía no salió del banco, así que tampoco bajó lo pendiente de la tarjeta:
+        // los 4.000 están en un lado o en el otro, nunca en ninguno.
+        Assert.Equal("4000", accounts["Visa"].Str("pendingObligationsMinor"));
+        Assert.Equal("4000", (await a.GetJson($"/api/v1/accounts/{visa}")).Str("pendingObligationsMinor"));
+        // Lo que falta pagar sí lo descuenta: el pago ya está registrado.
+        Assert.Empty((await a.GetJson($"/api/v1/obligations?accountId={visa}&currency=ARS")).EnumerateArray());
 
         app.Clock.Advance(TimeSpan.FromDays(40));
         var later = await ReloginAsync(app, a);
@@ -410,6 +685,7 @@ public class PaymentsAndPlansTests(PostgresFixture pg)
         // 100.000 − 1.000 − 2.000 + 50.000 − 3.000 − 4.000 + 10.000
         Assert.Equal("150000", accounts["Banco"].Str("cashBalanceMinor"));
         Assert.Equal("3000", accounts["Billetera"].Str("cashBalanceMinor"));
+        Assert.Equal("0", accounts["Visa"].Str("pendingObligationsMinor"));
     }
 
     [Fact]
