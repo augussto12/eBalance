@@ -12,7 +12,7 @@ cd "$(dirname "$0")/../.."
 img="${1:-alvarez-finanzas-backup:local}"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
-# Valores de prueba (no son secretos): el contenedor corre como 1654 y tiene que poder leerlos.
+# Valores de prueba (no son secretos): el contenedor corre sin root y tiene que poder leerlos.
 printf 'contrasena-de-prueba-restic' > "$tmp/restic_password"
 printf 'sin-uso-auth-trust' > "$tmp/db_migrator_password"
 chmod 644 "$tmp/restic_password" "$tmp/db_migrator_password"
@@ -133,8 +133,10 @@ ok "externo de solo agregar: código 3 sin borrar; con OFFSITE_PRUNE=1 se quita"
 pg_ctl -D /tmp/pg -m fast stop >/dev/null
 echo "backup-ops OK"
 INNER
-docker run --rm --network none --add-host db:127.0.0.1 --tmpfs /tmp:size=320m \
-  --tmpfs /keys:uid=1654,gid=1654,mode=0700 \
+# Sin root, como en compose.yaml. Con el uid 70 (postgres), que existe en toda imagen basada en postgres: initdb necesita
+# un usuario del sistema y las imágenes de releases anteriores no tienen el 1654. Los scripts no dependen del uid.
+docker run --rm --user 70:70 --network none --add-host db:127.0.0.1 --tmpfs /tmp:size=320m \
+  --tmpfs /keys:uid=70,gid=70,mode=0700 \
   -v "$tmp/inner.sh:/opt/alvarez/inner.sh:ro" \
   -v "$PWD/infra/docker/backup-ops.sh:/opt/alvarez/backup-ops.sh:ro" \
   -v "$PWD/infra/docker/backup-entrypoint.sh:/opt/alvarez/backup-entrypoint.sh:ro" \
